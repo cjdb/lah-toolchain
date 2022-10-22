@@ -1,0 +1,397 @@
+From 9258f59859981fb640df48d7a7a220c886332c42 Mon Sep 17 00:00:00 2001
+From: Christopher Di Bella <cjdb.ns@gmail.com>
+Date: Sun, 23 Oct 2022 00:37:32 -0700
+Subject: [PATCH 3/3] [clang] adds `__disable_adl` attribute
+
+Certain library functions need to disable ADL. For example, the functions
+in [range.iter.ops]/2 and [algorithms.requirements]/2 require functions
+declared in namespaces 'std::ranges' aren't found by ADL, and that they
+suppress ADL when called in an unqualified context (e.g. by way of a
+_using-directive_). Conversations with developers on the #include <C++>
+Discord channel identifies that there's a desire for this outside the
+ranges library.
+
+Libraries have been implementing these functions as function objects
+with varying rules (e.g. libc++ and Microsoft/STL both try their best to
+make the function objects appear as standard library function templates,
+while libstdc++ makes them plain function objects). Having a large number
+of types typically has a negative impact on both compile-times and progam
+size.
+
+This commit has seen compile times halved when the `__disable_adl`
+attribute is applied instead of opting to use a function object.
+
+Differential Revision: https://reviews.llvm.org/D129951
+---
+ clang/include/clang/AST/ExprCXX.h             |   3 +
+ clang/include/clang/Basic/Attr.td             |   7 +
+ clang/include/clang/Basic/AttrDocs.td         |   4 +
+ .../clang/Basic/DiagnosticSemaKinds.td        |   3 +
+ clang/include/clang/Basic/TokenKinds.def      |   1 +
+ clang/lib/Parse/ParseDecl.cpp                 |   8 +
+ clang/lib/Sema/SemaDeclAttr.cpp               |  12 ++
+ clang/lib/Sema/SemaLookup.cpp                 |   3 +
+ clang/lib/Sema/SemaOverload.cpp               |  23 ++-
+ clang/test/SemaCXX/disable-adl.cpp            | 160 ++++++++++++++++++
+ 10 files changed, 221 insertions(+), 3 deletions(-)
+ create mode 100644 clang/test/SemaCXX/disable-adl.cpp
+
+diff --git a/clang/include/clang/AST/ExprCXX.h b/clang/include/clang/AST/ExprCXX.h
+index 0b927c029475..b48e4cacc831 100644
+--- a/clang/include/clang/AST/ExprCXX.h
++++ b/clang/include/clang/AST/ExprCXX.h
+@@ -3164,6 +3164,9 @@ public:
+   /// argument-dependent lookup.
+   bool requiresADL() const { return UnresolvedLookupExprBits.RequiresADL; }
+ 
++  /// A function marked '__disable_adl' inhibits ADL.
++  void disableADL() { UnresolvedLookupExprBits.RequiresADL = false; }
++
+   /// True if this lookup is overloaded.
+   bool isOverloaded() const { return UnresolvedLookupExprBits.Overloaded; }
+ 
+diff --git a/clang/include/clang/Basic/Attr.td b/clang/include/clang/Basic/Attr.td
+index 16cf932c3760..2d20d4dadb66 100644
+--- a/clang/include/clang/Basic/Attr.td
++++ b/clang/include/clang/Basic/Attr.td
+@@ -4096,3 +4096,10 @@ def FunctionReturnThunks : InheritableAttr,
+   let Subjects = SubjectList<[Function]>;
+   let Documentation = [FunctionReturnThunksDocs];
+ }
++
++def DisableADL : InheritableAttr {
++  let Spellings = [Keyword<"__disable_adl">];
++  let Subjects = SubjectList<[Function]>;
++  let Documentation = [DisableADLDocs];
++  let LangOpts = [CPlusPlus];
++}
+diff --git a/clang/include/clang/Basic/AttrDocs.td b/clang/include/clang/Basic/AttrDocs.td
+index 3b441e757fae..7487397a62a6 100644
+--- a/clang/include/clang/Basic/AttrDocs.td
++++ b/clang/include/clang/Basic/AttrDocs.td
+@@ -6770,3 +6770,7 @@ The symbol used for ``thunk-extern`` is target specific:
+ As such, this function attribute is currently only supported on X86 targets.
+   }];
+ }
++
++def DisableADLDocs : Documentation {
++  let Content = [{Please don't LGTM without this being fully documented.}];
++}
+diff --git a/clang/include/clang/Basic/DiagnosticSemaKinds.td b/clang/include/clang/Basic/DiagnosticSemaKinds.td
+index 18fac0c55049..0db4ec29439c 100644
+--- a/clang/include/clang/Basic/DiagnosticSemaKinds.td
++++ b/clang/include/clang/Basic/DiagnosticSemaKinds.td
+@@ -3149,6 +3149,9 @@ def err_attribute_invalid_size : Error<
+   "vector size not an integral multiple of component size">;
+ def err_attribute_zero_size : Error<"zero %0 size">;
+ def err_attribute_size_too_large : Error<"%0 size too large">;
++def err_disable_adl_no_operators : Error<
++  "can't apply '__disable_adl' to %select{operators|member functions}0, since "
++  "they%select{'re supposed to be used| don't interact}0 with ADL">;
+ def err_typecheck_sve_ambiguous : Error<
+   "cannot combine fixed-length and sizeless SVE vectors in expression, result is ambiguous (%0 and %1)">;
+ def err_typecheck_sve_gnu_ambiguous : Error<
+diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
+index c159eb431cbd..fad042c33bc8 100644
+--- a/clang/include/clang/Basic/TokenKinds.def
++++ b/clang/include/clang/Basic/TokenKinds.def
+@@ -742,6 +742,7 @@ ALIAS("__char32_t"   , char32_t          , KEYCXX)
+ KEYWORD(__builtin_bit_cast               , KEYALL)
+ KEYWORD(__builtin_available              , KEYALL)
+ KEYWORD(__builtin_sycl_unique_stable_name, KEYSYCL)
++KEYWORD(__disable_adl                    , KEYCXX)
+ 
+ // Clang-specific keywords enabled only in testing.
+ TESTING_KEYWORD(__unknown_anytype , KEYALL)
+diff --git a/clang/lib/Parse/ParseDecl.cpp b/clang/lib/Parse/ParseDecl.cpp
+index fd3589846a3d..ba7f4079904c 100644
+--- a/clang/lib/Parse/ParseDecl.cpp
++++ b/clang/lib/Parse/ParseDecl.cpp
+@@ -3782,6 +3782,14 @@ void Parser::ParseDeclarationSpecifiers(
+       ParseAttributes(PAKM_GNU | PAKM_Declspec, DS.getAttributes(), LateAttrs);
+       continue;
+ 
++    case tok::kw___disable_adl: {
++      IdentifierInfo* AttrName = Tok.getIdentifierInfo();
++      SourceLocation AttrNameLoc = Tok.getLocation();
++      DS.getAttributes().addNew(AttrName, AttrNameLoc, nullptr, AttrNameLoc,
++                                nullptr, 0, ParsedAttr::AS_Keyword);
++      break;
++    }
++
+     // Microsoft single token adornments.
+     case tok::kw___forceinline: {
+       isInvalid = DS.setFunctionSpecForceInline(Loc, PrevSpec, DiagID);
+diff --git a/clang/lib/Sema/SemaDeclAttr.cpp b/clang/lib/Sema/SemaDeclAttr.cpp
+index d8dd1ab8e1d1..5e54b7aa9b4a 100644
+--- a/clang/lib/Sema/SemaDeclAttr.cpp
++++ b/clang/lib/Sema/SemaDeclAttr.cpp
+@@ -5640,6 +5640,14 @@ static void handleBuiltinAliasAttr(Sema &S, Decl *D,
+   D->addAttr(::new (S.Context) BuiltinAliasAttr(S.Context, AL, Ident));
+ }
+ 
++static void handleDisableADLAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
++  if (FunctionDecl *F = D->getAsFunction(); F->isOverloadedOperator() || F->isCXXClassMember()) {
++    S.Diag(AL.getLoc(), diag::err_disable_adl_no_operators) << F->isCXXClassMember();
++    return;
++  }
++  D->addAttr(::new (S.Context) DisableADLAttr(S.Context, AL));
++}
++
+ //===----------------------------------------------------------------------===//
+ // Checker-specific attribute handlers.
+ //===----------------------------------------------------------------------===//
+@@ -9230,6 +9238,10 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
+   case ParsedAttr::AT_UsingIfExists:
+     handleSimpleAttribute<UsingIfExistsAttr>(S, D, AL);
+     break;
++
++  case ParsedAttr::AT_DisableADL:
++    handleDisableADLAttr(S, D, AL);
++    break;
+   }
+ }
+ 
+diff --git a/clang/lib/Sema/SemaLookup.cpp b/clang/lib/Sema/SemaLookup.cpp
+index a144cb40b7ab..c0f4bfff9a51 100644
+--- a/clang/lib/Sema/SemaLookup.cpp
++++ b/clang/lib/Sema/SemaLookup.cpp
+@@ -3861,6 +3861,9 @@ void Sema::ArgumentDependentLookup(DeclarationName Name, SourceLocation Loc,
+           !isa<FunctionTemplateDecl>(Underlying))
+         continue;
+ 
++      if (Underlying->getAsFunction()->hasAttr<DisableADLAttr>())
++        continue;
++
+       // The declaration is visible to argument-dependent lookup if either
+       // it's ordinarily visible or declared as a friend in an associated
+       // class.
+diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
+index b71a30ac8925..36b7934f2026 100644
+--- a/clang/lib/Sema/SemaOverload.cpp
++++ b/clang/lib/Sema/SemaOverload.cpp
+@@ -12892,12 +12892,21 @@ static void AddOverloadedCallCandidate(Sema &S,
+                                        ArrayRef<Expr *> Args,
+                                        OverloadCandidateSet &CandidateSet,
+                                        bool PartialOverloading,
+-                                       bool KnownValid) {
++                                       bool KnownValid,
++                                       UnresolvedLookupExpr* ULE) {
+   NamedDecl *Callee = FoundDecl.getDecl();
+   if (isa<UsingShadowDecl>(Callee))
+     Callee = cast<UsingShadowDecl>(Callee)->getTargetDecl();
+ 
+   if (FunctionDecl *Func = dyn_cast<FunctionDecl>(Callee)) {
++    if (Func->hasAttr<DisableADLAttr>()) {
++      assert(ULE && "only valid when ADL is up for consideration");
++      ULE->disableADL();
++    }
++    // else if (!CandidateSet.empty() && CandidateSet.begin()->FoundDecl->hasAttr<DisableADLAttr>()) {
++    //   return;
++    // }
++
+     if (ExplicitTemplateArgs) {
+       assert(!KnownValid && "Explicit template arguments?");
+       return;
+@@ -12914,6 +12923,14 @@ static void AddOverloadedCallCandidate(Sema &S,
+ 
+   if (FunctionTemplateDecl *FuncTemplate
+       = dyn_cast<FunctionTemplateDecl>(Callee)) {
++    if (FuncTemplate->getAsFunction()->hasAttr<DisableADLAttr>()) {
++      assert(ULE && "only valid when ADL is up for consideration");
++      ULE->disableADL();
++    }
++    // else if (!CandidateSet.empty() && CandidateSet.begin()->FoundDecl->hasAttr<DisableADLAttr>()) {
++    //   return;
++    // }
++
+     S.AddTemplateOverloadCandidate(FuncTemplate, FoundDecl,
+                                    ExplicitTemplateArgs, Args, CandidateSet,
+                                    /*SuppressUserConversions=*/false,
+@@ -12972,7 +12989,7 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
+          E = ULE->decls_end(); I != E; ++I)
+     AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
+                                CandidateSet, PartialOverloading,
+-                               /*KnownValid*/ true);
++                               /*KnownValid*/ true, ULE);
+ 
+   if (ULE->requiresADL())
+     AddArgumentDependentLookupCandidates(ULE->getName(), ULE->getExprLoc(),
+@@ -12987,7 +13004,7 @@ void Sema::AddOverloadedCallCandidates(
+     ArrayRef<Expr *> Args, OverloadCandidateSet &CandidateSet) {
+   for (LookupResult::iterator I = R.begin(), E = R.end(); I != E; ++I)
+     AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
+-                               CandidateSet, false, /*KnownValid*/ false);
++                               CandidateSet, false, /*KnownValid*/ false, nullptr);
+ }
+ 
+ /// Determine whether a declaration with the specified name could be moved into
+diff --git a/clang/test/SemaCXX/disable-adl.cpp b/clang/test/SemaCXX/disable-adl.cpp
+new file mode 100644
+index 000000000000..5a02cb47340a
+--- /dev/null
++++ b/clang/test/SemaCXX/disable-adl.cpp
+@@ -0,0 +1,160 @@
++// RUN: %clang_cc1 %s -fsyntax-only -verify
++
++namespace NS1 {
++  struct S1 {};
++  S1 inhibited(S1); // expected-note 2 {{candidate function}}
++
++  namespace NNS1 {
++    struct S2 {};
++    __disable_adl void hidden(S2);   // expected-note{{declared here}}
++    __disable_adl int inhibited(S1); // expected-note 4 {{candidate function}}
++  }
++}
++
++namespace NS2 {
++  __disable_adl void inhibited(NS1::S1); // expected-note 2 {{candidate function}}
++}
++
++void test_functions() {
++  hidden(NS1::NNS1::S2{}); // expected-error{{use of undeclared identifier 'hidden'; did you mean 'NS1::NNS1::hidden'?}}
++  {
++    NS1::S1 x = inhibited(NS1::S1{}); // no error
++  }
++  {
++    using namespace NS1::NNS1;
++    int x = inhibited(NS1::S1{}); // no error
++
++    using namespace NS1;
++    S1 y = inhibited(NS1::S1{}); // expected-error{{call to 'inhibited' is ambiguous}}
++  }
++  {
++    using NS1::NNS1::inhibited;
++    int x = inhibited(NS1::S1{}); // no error
++
++    using NS1::inhibited;
++    NS1::S1 y = inhibited(NS1::S1{}); // expected-error{{call to 'inhibited' is ambiguous}}
++  }
++  {
++    using namespace NS2;
++    inhibited(NS1::S1{}); // no error
++
++    using namespace NS1::NNS1;
++    inhibited(NS1::S1{}); // expected-error{{call to 'inhibited' is ambiguous}}
++  }
++  {
++    using NS2::inhibited;
++    inhibited(NS1::S1{}); // no error
++
++    using NS1::NNS1::inhibited;
++    inhibited(NS1::S1{}); // expected-error{{call to 'inhibited' is ambiguous}}
++  }
++}
++
++namespace NS1 {
++  template<typename T>
++  S1 inhibited_template(T); // expected-note 2 {{candidate function}}
++
++  namespace NNS1 {
++    template<typename T>
++    __disable_adl void hidden_template(T); // expected-note{{declared here}}
++
++    template<typename T>
++    __disable_adl int inhibited_template(T); // expected-note 4 {{candidate function}}
++  }
++}
++
++namespace NS2 {
++  template<typename T>
++  __disable_adl int inhibited_template(T); // expected-note 2 {{candidate function}}
++}
++
++void test_function_templates() {
++  hidden_template(NS1::NNS1::S2{}); // expected-error{{use of undeclared identifier 'hidden_template'; did you mean 'NS1::NNS1::hidden_template'?}}
++
++  {
++    NS1::S1 x = inhibited_template(NS1::S1{}); // no error
++  }
++  {
++    using namespace NS1::NNS1;
++    int x = inhibited_template(NS1::S1{}); // no error
++
++    using namespace NS1;
++    S1 y = inhibited_template(NS1::S1{}); // expected-error{{call to 'inhibited_template' is ambiguous}}
++  }
++  {
++    using NS1::NNS1::inhibited_template;
++    int x = inhibited_template(NS1::S1{}); // no error
++
++    using NS1::inhibited_template;
++    NS1::S1 y = inhibited_template(NS1::S1{}); // expected-error{{call to 'inhibited_template' is ambiguous}}
++  }
++  {
++    using namespace NS2;
++    inhibited_template(NS1::S1{}); // no error
++
++    using namespace NS1::NNS1;
++    inhibited_template(NS1::S1{}); // expected-error{{call to 'inhibited_template' is ambiguous}}
++  }
++  {
++    using NS2::inhibited_template;
++    inhibited_template(NS1::S1{}); // no error
++
++    using NS1::NNS1::inhibited_template;
++    inhibited_template(NS1::S1{}); // expected-error{{call to 'inhibited_template' is ambiguous}}
++  }
++}
++
++namespace NS1 {
++  S1 inhibited_mixed(S1);
++
++  namespace NNS1 {
++    template<typename T>
++    __disable_adl int inhibited_mixed(T);
++  }
++}
++
++void test_mixed() {
++  using namespace NS1::NNS1;
++  int x = inhibited_mixed(NS1::S1{}); // no error
++}
++
++// Should be covered by the hidden functions checks, but just to be sure.
++void test_NNS1_hidden() {
++  {
++    NS1::S1 a = inhibited(NS1::S1{});
++    NS1::S1 b = inhibited_template(NS1::S1{});
++    NS1::S1 c = inhibited_mixed(NS1::S1{});
++  }
++  {
++    using namespace NS1;
++    NS1::S1 a = inhibited(NS1::S1{});
++    NS1::S1 b = inhibited_template(NS1::S1{});
++    NS1::S1 c = inhibited_mixed(NS1::S1{});
++  }
++}
++
++namespace NS1 {
++  namespace NNS1 {
++    __disable_adl void operator-(S2); // expected-error{{can't apply '__disable_adl' to operators, since they're supposed to be used with ADL}}
++
++    struct hidden_friend_operator {
++      friend void operator-(hidden_friend_operator i, int) {}
++    };
++
++    struct hidden_friend_swap {
++      __disable_adl friend void swap(hidden_friend_swap, hidden_friend_swap) {}
++    };
++  }
++}
++
++void test_friends_and_operators() {
++  -NS1::NNS1::S2{};                        // no error
++  NS1::NNS1::hidden_friend_operator{} - 1; // no error
++
++  swap(NS1::NNS1::hidden_friend_swap{}, NS1::NNS1::hidden_friend_swap{}); // expected-error{{use of undeclared identifier 'swap'}}
++}
++
++struct S {
++  __disable_adl void f();        // expected-error{{can't apply '__disable_adl' to member functions, since they don't interact with ADL}}
++  __disable_adl static void g(); // expected-error{{can't apply '__disable_adl' to member functions, since they don't interact with ADL}}
++};
+-- 
+2.25.1
+

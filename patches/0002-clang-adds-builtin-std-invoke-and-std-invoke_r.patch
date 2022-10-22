@@ -1,0 +1,1649 @@
+From 71b5b962a16b89e18bceaedc3178b7fda346c009 Mon Sep 17 00:00:00 2001
+From: Christopher Di Bella <cjdb.ns@gmail.com>
+Date: Sun, 23 Oct 2022 00:31:28 -0700
+Subject: [PATCH 2/3] [clang] adds builtin `std::invoke` and `std::invoke_r`
+
+`std::invoke` and `std::invoke_r` are fairly expensive in debug builds,
+and are used extensively by standard ranges. By lifting these functions
+into the compiler, we save a fair amount of space and improve run-time.
+
+The changes in this commit were used to build a slightly modified
+version of range-v3. range-v3 normally rolls its own `invoke` as a
+function object, so the experiment deleted that code in favour of
+using `std::invoke`.
+
+|                       | Build time    | Build directory size | CTest time |
+| --------------------- | ------------- | -------------------- | ---------- |
+| libstdc++ w/o D130867 | User: 465.04s | 478504 bytes         | 13.19s     |
+|                       | Sys:   58.98s | (468 MB)             |            |
+| --------------------- | ------------- | -------------------- | ---------- |
+| libstdc++ w/  D130867 | User: 468.49s | 456936 bytes         |  7.79s     |
+|                       | Sys:   57.31s | (457 MB)             |            |
+| --------------------- | ------------- | -------------------- | ---------- |
+| libc++    w/o D130867 | User: 627.67s | 795652 bytes         | 11.88s     |
+|                       | Sys:   67.16s | (778 MB)             |            |
+| --------------------- | ------------- | -------------------- | ---------- |
+| libc++    w/  D130867 | User: 626.03s | 781392 bytes         |  8.32s     |
+|                       | Sys:   65.77s | (764MB)              |            |
+
+Differential Revision: https://reviews.llvm.org/D130867
+---
+ clang/docs/ReleaseNotes.rst                   |   3 +
+ clang/include/clang/Basic/Builtins.def        |   2 +
+ .../clang/Basic/DiagnosticSemaKinds.td        |  27 +
+ clang/include/clang/Sema/Sema.h               |  77 +--
+ clang/lib/AST/ExprConstant.cpp                |   2 +
+ clang/lib/CodeGen/CGBuiltin.cpp               |   2 +
+ clang/lib/Sema/SemaChecking.cpp               |   6 +
+ clang/lib/Sema/SemaDecl.cpp                   |   3 +
+ clang/lib/Sema/SemaExpr.cpp                   | 119 +++--
+ clang/lib/Sema/SemaExprCXX.cpp                | 203 ++++++-
+ clang/lib/Sema/SemaOverload.cpp               | 129 ++---
+ clang/test/SemaCXX/builtin-std-invoke.cpp     | 496 ++++++++++++++++++
+ 12 files changed, 923 insertions(+), 146 deletions(-)
+ create mode 100644 clang/test/SemaCXX/builtin-std-invoke.cpp
+
+diff --git a/clang/docs/ReleaseNotes.rst b/clang/docs/ReleaseNotes.rst
+index 0dec5de56d38..426d04a8525a 100644
+--- a/clang/docs/ReleaseNotes.rst
++++ b/clang/docs/ReleaseNotes.rst
+@@ -504,6 +504,9 @@ C++ Language Changes in Clang
+   This means Clang will by default accept code using features from C++17 and
+   conforming GNU extensions. Projects incompatible with C++17 can add
+   ``-std=gnu++14`` to their build settings to restore the previous behaviour.
++- Improved ``-O0`` code generation for calls to ``std::invoke``, and
++  ``std::invoke_r``. These are now treated as compiler builtins and implemented
++  directly, rather than instantiating a definition from the standard library.
+ 
+ C++20 Feature Support
+ ^^^^^^^^^^^^^^^^^^^^^
+diff --git a/clang/include/clang/Basic/Builtins.def b/clang/include/clang/Basic/Builtins.def
+index d9faafd8813e..cabceb3ea5c3 100644
+--- a/clang/include/clang/Basic/Builtins.def
++++ b/clang/include/clang/Basic/Builtins.def
+@@ -1561,6 +1561,8 @@ LIBBUILTIN(addressof, "v*v&", "zfncThE", "memory", CXX_LANG)
+ LANGBUILTIN(__addressof, "v*v&", "zfncTE", CXX_LANG)
+ LIBBUILTIN(as_const, "v&v&", "zfncThE", "utility", CXX_LANG)
+ LIBBUILTIN(forward, "v&v&", "zfncThE", "utility", CXX_LANG)
++LIBBUILTIN(invoke, "v.", "zfTh", "functional", CXX_LANG)
++LIBBUILTIN(invoke_r, "v.", "zfTh", "functional", CXX_LANG)
+ LIBBUILTIN(move, "v&v&", "zfncThE", "utility", CXX_LANG)
+ LIBBUILTIN(move_if_noexcept, "v&v&", "zfncThE", "utility", CXX_LANG)
+ 
+diff --git a/clang/include/clang/Basic/DiagnosticSemaKinds.td b/clang/include/clang/Basic/DiagnosticSemaKinds.td
+index b1d475772502..18fac0c55049 100644
+--- a/clang/include/clang/Basic/DiagnosticSemaKinds.td
++++ b/clang/include/clang/Basic/DiagnosticSemaKinds.td
+@@ -8435,6 +8435,33 @@ def err_typecheck_call_too_many_args_at_most_suggest : Error<
+   "%select{function|block|method|kernel function}0 call, "
+   "expected at most %1, have %2; did you mean %3?">;
+ 
++def err_invoke_pointer_to_member_too_few_args : Error<
++  "can't invoke pointer-to-%select{data member|member function}0: "
++  "'std::invoke%select{|_r}1' must have %select{exactly|at least}0 2 arguments "
++  "for a pointer-to-%select{data member|member function}0, got %2">;
++def err_invoke_pointer_to_member_incompatible_second_arg : Error<
++  "can't invoke pointer-to-%select{data member|member function}0: expected "
++  "second argument to be a %select{reference|wrapee|pointer}1 to a class "
++  "compatible with %2, got %3">;
++def err_invoke_pointer_to_member_drops_qualifiers : Error<
++  "can't invoke pointer-to-member function: '%0' drops '%1' qualifier%s2">;
++def err_invoke_pointer_to_member_ref_qualifiers : Error<
++  "can't invoke pointer-to-member function: '%0' can only be called on an "
++  "%select{lvalue|rvalue}1">;
++def err_invoke_wrong_number_of_args : Error<
++  "can't invoke %select{function|block|pointer-to-member function}0: expected "
++  "%1 %select{argument|arguments}2, got %3">;
++def err_invoke_function_object : Error<
++  "can't invoke %0 function object: %select{no|%2}1 suitable "
++  "overload%s2 found%select{|, which makes choosing ambiguous}1">;
++def err_invoke_function_object_deleted : Error<
++  "can't invoke %select{function|pointer-to-member function|"
++  "%1 function object}0: chosen overload candidate is deleted">;
++def err_invoke_bad_conversion : Error<
++  "can't invoke %select{function|block|pointer-to-data member|"
++  "pointer-to-member function|%3 function object}0: return type "
++  "%1 isn't convertible to %2">;
++
+ def err_arc_typecheck_convert_incompatible_pointer : Error<
+   "incompatible pointer types passing retainable parameter of type %0"
+   "to a CF function expecting %1 type">;
+diff --git a/clang/include/clang/Sema/Sema.h b/clang/include/clang/Sema/Sema.h
+index e84e6b22f281..01f2f4d404bd 100644
+--- a/clang/include/clang/Sema/Sema.h
++++ b/clang/include/clang/Sema/Sema.h
+@@ -4145,20 +4145,20 @@ public:
+ 
+   ExprResult CreateOverloadedUnaryOp(SourceLocation OpLoc,
+                                      UnaryOperatorKind Opc,
+-                                     const UnresolvedSetImpl &Fns,
+-                                     Expr *input, bool RequiresADL = true);
++                                     const UnresolvedSetImpl &Fns, Expr *input,
++                                     bool RequiresADL = true,
++                                     bool IsStdInvoke = false);
+ 
+   void LookupOverloadedBinOp(OverloadCandidateSet &CandidateSet,
+                              OverloadedOperatorKind Op,
+                              const UnresolvedSetImpl &Fns,
+                              ArrayRef<Expr *> Args, bool RequiresADL = true);
+-  ExprResult CreateOverloadedBinOp(SourceLocation OpLoc,
+-                                   BinaryOperatorKind Opc,
+-                                   const UnresolvedSetImpl &Fns,
+-                                   Expr *LHS, Expr *RHS,
+-                                   bool RequiresADL = true,
++  ExprResult CreateOverloadedBinOp(SourceLocation OpLoc, BinaryOperatorKind Opc,
++                                   const UnresolvedSetImpl &Fns, Expr *LHS,
++                                   Expr *RHS, bool RequiresADL = true,
+                                    bool AllowRewrittenCandidates = true,
+-                                   FunctionDecl *DefaultedFn = nullptr);
++                                   FunctionDecl *DefaultedFn = nullptr,
++                                   bool IsStdInvoke = false);
+   ExprResult BuildSynthesizedThreeWayComparison(SourceLocation OpLoc,
+                                                 const UnresolvedSetImpl &Fns,
+                                                 Expr *LHS, Expr *RHS,
+@@ -4168,17 +4168,16 @@ public:
+                                                 SourceLocation RLoc, Expr *Base,
+                                                 MultiExprArg Args);
+ 
+-  ExprResult BuildCallToMemberFunction(Scope *S, Expr *MemExpr,
+-                                       SourceLocation LParenLoc,
+-                                       MultiExprArg Args,
+-                                       SourceLocation RParenLoc,
+-                                       Expr *ExecConfig = nullptr,
+-                                       bool IsExecConfig = false,
+-                                       bool AllowRecovery = false);
+-  ExprResult
+-  BuildCallToObjectOfClassType(Scope *S, Expr *Object, SourceLocation LParenLoc,
+-                               MultiExprArg Args,
+-                               SourceLocation RParenLoc);
++  ExprResult BuildCallToMemberFunction(
++      Scope *S, Expr *MemExpr, SourceLocation LParenLoc, MultiExprArg Args,
++      SourceLocation RParenLoc, Expr *ExecConfig = nullptr,
++      bool IsExecConfig = false, bool AllowRecovery = false,
++      bool IsStdInvoke = false);
++  ExprResult BuildCallToObjectOfClassType(Scope *S, Expr *Object,
++                                          SourceLocation LParenLoc,
++                                          MultiExprArg Args,
++                                          SourceLocation RParenLoc,
++                                          bool IsStdInvoke = false);
+ 
+   ExprResult BuildOverloadedArrowExpr(Scope *S, Expr *Base,
+                                       SourceLocation OpLoc,
+@@ -5319,7 +5318,8 @@ public:
+                          bool ObjCPropertyAccess = false,
+                          bool AvoidPartialAvailabilityChecks = false,
+                          ObjCInterfaceDecl *ClassReciever = nullptr,
+-                         bool SkipTrailingRequiresClause = false);
++                         bool SkipTrailingRequiresClause = false,
++                         bool IsStdInvoke = false);
+   void NoteDeletedFunction(FunctionDecl *FD);
+   void NoteDeletedInheritingConstructor(CXXConstructorDecl *CD);
+   bool DiagnosePropertyAccessorMismatch(ObjCPropertyDecl *PD,
+@@ -5629,11 +5629,11 @@ public:
+ 
+   // Binary/Unary Operators.  'Tok' is the token for the operator.
+   ExprResult CreateBuiltinUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
+-                                  Expr *InputExpr, bool IsAfterAmp = false);
++                                  Expr *InputExpr, bool IsAfterAmp = false, bool IsStdInvoke = false);
+   ExprResult BuildUnaryOp(Scope *S, SourceLocation OpLoc, UnaryOperatorKind Opc,
+-                          Expr *Input, bool IsAfterAmp = false);
+-  ExprResult ActOnUnaryOp(Scope *S, SourceLocation OpLoc, tok::TokenKind Op,
+-                          Expr *Input, bool IsAfterAmp = false);
++                          Expr *Input, bool IsAfterAmp = false, bool IsStdInvoke = false);
++  ExprResult ActOnUnaryOp(Scope *S, SourceLocation OpLoc,
++                          tok::TokenKind Op, Expr *Input, bool IsAfterAmp = false);
+ 
+   bool isQualifiedMemberAccess(Expr *E);
+   QualType CheckAddressOfOperand(ExprResult &Operand, SourceLocation OpLoc);
+@@ -5778,16 +5778,18 @@ public:
+                   const TemplateArgumentListInfo *TemplateArgs = nullptr);
+ 
+   void ActOnDefaultCtorInitializers(Decl *CDtorDecl);
+-  bool ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
+-                               FunctionDecl *FDecl,
++  bool ConvertArgumentsForCall(CallExpr *Call, Expr *Fn, FunctionDecl *FDecl,
+                                const FunctionProtoType *Proto,
+-                               ArrayRef<Expr *> Args,
+-                               SourceLocation RParenLoc,
+-                               bool ExecConfig = false);
++                               ArrayRef<Expr *> Args, SourceLocation RParenLoc,
++                               bool ExecConfig = false,
++                               bool IsStdInvoke = false);
+   void CheckStaticArrayArgument(SourceLocation CallLoc,
+                                 ParmVarDecl *Param,
+                                 const Expr *ArgExpr);
+ 
++  ExprResult BuildStdInvokeCall(CallExpr *TheCall, FunctionDecl *FDecl,
++                                unsigned int BuiltinID);
++
+   /// ActOnCallExpr - Handle a call to Fn with the specified array of arguments.
+   /// This provides the location of the left/right parens and a list of comma
+   /// locations.
+@@ -5798,7 +5800,8 @@ public:
+                            MultiExprArg ArgExprs, SourceLocation RParenLoc,
+                            Expr *ExecConfig = nullptr,
+                            bool IsExecConfig = false,
+-                           bool AllowRecovery = false);
++                           bool AllowRecovery = false,
++                           bool IsStdInvoke = false);
+   Expr *BuildBuiltinCallExpr(SourceLocation Loc, Builtin::ID Id,
+                              MultiExprArg CallArgs);
+   enum class AtomicArgumentOrder { API, AST };
+@@ -5811,7 +5814,8 @@ public:
+   BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl, SourceLocation LParenLoc,
+                         ArrayRef<Expr *> Arg, SourceLocation RParenLoc,
+                         Expr *Config = nullptr, bool IsExecConfig = false,
+-                        ADLCallKind UsesADL = ADLCallKind::NotADL);
++                        ADLCallKind UsesADL = ADLCallKind::NotADL,
++                        bool IsStdInvoke = false);
+ 
+   ExprResult ActOnCUDAExecConfigExpr(Scope *S, SourceLocation LLLLoc,
+                                      MultiExprArg ExecConfig,
+@@ -5862,10 +5866,11 @@ private:
+ public:
+   ExprResult ActOnBinOp(Scope *S, SourceLocation TokLoc,
+                         tok::TokenKind Kind, Expr *LHSExpr, Expr *RHSExpr);
+-  ExprResult BuildBinOp(Scope *S, SourceLocation OpLoc,
+-                        BinaryOperatorKind Opc, Expr *LHSExpr, Expr *RHSExpr);
++  ExprResult BuildBinOp(Scope *S, SourceLocation OpLoc, BinaryOperatorKind Opc,
++                        Expr *LHSExpr, Expr *RHSExpr, bool IsStdInvoke = false);
+   ExprResult CreateBuiltinBinOp(SourceLocation OpLoc, BinaryOperatorKind Opc,
+-                                Expr *LHSExpr, Expr *RHSExpr);
++                                Expr *LHSExpr, Expr *RHSExpr,
++                                bool IsStdInvoke = false);
+   void LookupBinOp(Scope *S, SourceLocation OpLoc, BinaryOperatorKind Opc,
+                    UnresolvedSetImpl &Functions);
+ 
+@@ -12329,8 +12334,8 @@ public:
+   QualType InvalidLogicalVectorOperands(SourceLocation Loc, ExprResult &LHS,
+                                  ExprResult &RHS);
+   QualType CheckPointerToMemberOperands( // C++ 5.5
+-    ExprResult &LHS, ExprResult &RHS, ExprValueKind &VK,
+-    SourceLocation OpLoc, bool isIndirect);
++      ExprResult &LHS, ExprResult &RHS, ExprValueKind &VK, SourceLocation OpLoc,
++      bool isIndirect, bool IsStdInvoke = false);
+   QualType CheckMultiplyDivideOperands( // C99 6.5.5
+     ExprResult &LHS, ExprResult &RHS, SourceLocation Loc, bool IsCompAssign,
+     bool IsDivide);
+diff --git a/clang/lib/AST/ExprConstant.cpp b/clang/lib/AST/ExprConstant.cpp
+index 4160aa6458c8..c9bd6fa0fdc4 100644
+--- a/clang/lib/AST/ExprConstant.cpp
++++ b/clang/lib/AST/ExprConstant.cpp
+@@ -8345,6 +8345,8 @@ bool LValueExprEvaluator::VisitCallExpr(const CallExpr *E) {
+     return false;
+   case Builtin::BIas_const:
+   case Builtin::BIforward:
++  case Builtin::BIinvoke:
++  case Builtin::BIinvoke_r:
+   case Builtin::BImove:
+   case Builtin::BImove_if_noexcept:
+     if (cast<FunctionDecl>(E->getCalleeDecl())->isConstexpr())
+diff --git a/clang/lib/CodeGen/CGBuiltin.cpp b/clang/lib/CodeGen/CGBuiltin.cpp
+index 2a3da01febe2..eb04b2397942 100644
+--- a/clang/lib/CodeGen/CGBuiltin.cpp
++++ b/clang/lib/CodeGen/CGBuiltin.cpp
+@@ -4637,6 +4637,8 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
+   case Builtin::BImove_if_noexcept:
+   case Builtin::BIforward:
+   case Builtin::BIas_const:
++  case Builtin::BIinvoke:
++  case Builtin::BIinvoke_r:
+     return RValue::get(EmitLValue(E->getArg(0)).getPointer(*this));
+   case Builtin::BI__GetExceptionInfo: {
+     if (llvm::GlobalVariable *GV =
+diff --git a/clang/lib/Sema/SemaChecking.cpp b/clang/lib/Sema/SemaChecking.cpp
+index 0727433fbc43..63f9649f4e1c 100644
+--- a/clang/lib/Sema/SemaChecking.cpp
++++ b/clang/lib/Sema/SemaChecking.cpp
+@@ -28,6 +28,7 @@
+ #include "clang/AST/ExprOpenMP.h"
+ #include "clang/AST/FormatString.h"
+ #include "clang/AST/NSAPI.h"
++#include "clang/AST/NestedNameSpecifier.h"
+ #include "clang/AST/NonTrivialTypeVisitor.h"
+ #include "clang/AST/OperationKinds.h"
+ #include "clang/AST/RecordLayout.h"
+@@ -2462,6 +2463,11 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
+     }
+     break;
+   }
++  case Builtin::BIinvoke:
++  case Builtin::BIinvoke_r: {
++    TheCallResult = BuildStdInvokeCall(TheCall, FDecl, BuiltinID);
++    break;
++  }
+   // OpenCL v2.0, s6.13.16 - Pipe functions
+   case Builtin::BIread_pipe:
+   case Builtin::BIwrite_pipe:
+diff --git a/clang/lib/Sema/SemaDecl.cpp b/clang/lib/Sema/SemaDecl.cpp
+index 19bd670e791b..1ec12c61ca25 100644
+--- a/clang/lib/Sema/SemaDecl.cpp
++++ b/clang/lib/Sema/SemaDecl.cpp
+@@ -9505,6 +9505,9 @@ static bool isStdBuiltin(ASTContext &Ctx, FunctionDecl *FD,
+     const auto *FPT = FD->getType()->castAs<FunctionProtoType>();
+     return FPT->getNumParams() == 1 && !FPT->isVariadic();
+   }
++  case Builtin::BIinvoke:
++  case Builtin::BIinvoke_r:
++    return true;
+ 
+   default:
+     return false;
+diff --git a/clang/lib/Sema/SemaExpr.cpp b/clang/lib/Sema/SemaExpr.cpp
+index 2493b4a76d5e..448fb796a0f0 100644
+--- a/clang/lib/Sema/SemaExpr.cpp
++++ b/clang/lib/Sema/SemaExpr.cpp
+@@ -223,7 +223,8 @@ bool Sema::DiagnoseUseOfDecl(NamedDecl *D, ArrayRef<SourceLocation> Locs,
+                              bool ObjCPropertyAccess,
+                              bool AvoidPartialAvailabilityChecks,
+                              ObjCInterfaceDecl *ClassReceiver,
+-                             bool SkipTrailingRequiresClause) {
++                             bool SkipTrailingRequiresClause,
++                             bool IsStdInvoke) {
+   SourceLocation Loc = Locs.front();
+   if (getLangOpts().CPlusPlus && isa<FunctionDecl>(D)) {
+     // If there were any diagnostics suppressed by template argument deduction,
+@@ -264,13 +265,15 @@ bool Sema::DiagnoseUseOfDecl(NamedDecl *D, ArrayRef<SourceLocation> Locs,
+     // See if this is a deleted function.
+     if (FD->isDeleted()) {
+       auto *Ctor = dyn_cast<CXXConstructorDecl>(FD);
+-      if (Ctor && Ctor->isInheritingConstructor())
+-        Diag(Loc, diag::err_deleted_inherited_ctor_use)
+-            << Ctor->getParent()
+-            << Ctor->getInheritedConstructor().getConstructor()->getParent();
+-      else
+-        Diag(Loc, diag::err_deleted_function_use);
+-      NoteDeletedFunction(FD);
++      if (!IsStdInvoke) {
++        if (Ctor && Ctor->isInheritingConstructor())
++          Diag(Loc, diag::err_deleted_inherited_ctor_use)
++              << Ctor->getParent()
++              << Ctor->getInheritedConstructor().getConstructor()->getParent();
++        else
++          Diag(Loc, diag::err_deleted_function_use);
++        NoteDeletedFunction(FD);
++      }
+       return true;
+     }
+ 
+@@ -6006,13 +6009,12 @@ static TypoCorrection TryTypoCorrectionForCall(Sema &S, Expr *Fn,
+ /// Fn is the function expression. For a C++ member function, this
+ /// routine does not attempt to convert the object argument. Returns
+ /// true if the call is ill-formed.
+-bool
+-Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
+-                              FunctionDecl *FDecl,
+-                              const FunctionProtoType *Proto,
+-                              ArrayRef<Expr *> Args,
+-                              SourceLocation RParenLoc,
+-                              bool IsExecConfig) {
++bool Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
++                                   FunctionDecl *FDecl,
++                                   const FunctionProtoType *Proto,
++                                   ArrayRef<Expr *> Args,
++                                   SourceLocation RParenLoc, bool IsExecConfig,
++                                   bool IsStdInvoke) {
+   // Bail out early if calling a builtin with custom typechecking.
+   if (FDecl)
+     if (unsigned ID = FDecl->getBuiltinID())
+@@ -6034,7 +6036,17 @@ Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
+   if (Args.size() < NumParams) {
+     if (Args.size() < MinArgs) {
+       TypoCorrection TC;
+-      if (FDecl && (TC = TryTypoCorrectionForCall(*this, Fn, FDecl, Args))) {
++      if (IsStdInvoke) {
++        QualType FnType = Fn->getType();
++        unsigned Kind = FnType->isRecordType() ? 3 // function object
++                        : isa<BinaryOperator>(Fn)
++                            ? 2 // pointer-to-member-function
++                        : FnType->isBlockPointerType() ? 1  // block
++                                                       : 0; // function
++        Diag(Call->getBeginLoc(), diag::err_invoke_wrong_number_of_args)
++            << Kind << NumParams << (NumParams != 1) << Args.size();
++      } else if (FDecl &&
++                 (TC = TryTypoCorrectionForCall(*this, Fn, FDecl, Args))) {
+         unsigned diag_id =
+             MinArgs == NumParams && !Proto->isVariadic()
+                 ? diag::err_typecheck_call_too_few_args_suggest
+@@ -6072,7 +6084,17 @@ Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
+   if (Args.size() > NumParams) {
+     if (!Proto->isVariadic()) {
+       TypoCorrection TC;
+-      if (FDecl && (TC = TryTypoCorrectionForCall(*this, Fn, FDecl, Args))) {
++      if (IsStdInvoke) {
++        QualType FnType = Fn->getType();
++        unsigned Kind = FnType->isRecordType() ? 3 // function object
++                        : isa<BinaryOperator>(Fn)
++                            ? 2 // pointer-to-member-function
++                        : FnType->isBlockPointerType() ? 1  // block
++                                                       : 0; // function
++        Diag(Call->getBeginLoc(), diag::err_invoke_wrong_number_of_args)
++            << Kind << NumParams << (NumParams != 1) << Args.size();
++      } else if (FDecl &&
++                 (TC = TryTypoCorrectionForCall(*this, Fn, FDecl, Args))) {
+         unsigned diag_id =
+             MinArgs == NumParams && !Proto->isVariadic()
+                 ? diag::err_typecheck_call_too_many_args_suggest
+@@ -6641,7 +6663,7 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+                                MultiExprArg ArgExprs, SourceLocation RParenLoc,
+                                Expr *ExecConfig, bool IsExecConfig,
+-                               bool AllowRecovery) {
++                               bool AllowRecovery, bool IsStdInvoke) {
+   // Since this might be a postfix expression, get rid of ParenListExprs.
+   ExprResult Result = MaybeConvertParenListExprToParenExpr(Scope, Fn);
+   if (Result.isInvalid()) return ExprError();
+@@ -6692,7 +6714,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+     // Determine whether this is a call to an object (C++ [over.call.object]).
+     if (Fn->getType()->isRecordType())
+       return BuildCallToObjectOfClassType(Scope, Fn, LParenLoc, ArgExprs,
+-                                          RParenLoc);
++                                          RParenLoc, IsStdInvoke);
+ 
+     if (Fn->getType() == Context.UnknownAnyTy) {
+       ExprResult result = rebuildUnknownAnyFunction(*this, Fn);
+@@ -6703,7 +6725,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+     if (Fn->getType() == Context.BoundMemberTy) {
+       return BuildCallToMemberFunction(Scope, Fn, LParenLoc, ArgExprs,
+                                        RParenLoc, ExecConfig, IsExecConfig,
+-                                       AllowRecovery);
++                                       AllowRecovery, IsStdInvoke);
+     }
+   }
+ 
+@@ -6723,7 +6745,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+             /*AllowTypoCorrection=*/true, find.IsAddressOfOperand);
+       return BuildCallToMemberFunction(Scope, Fn, LParenLoc, ArgExprs,
+                                        RParenLoc, ExecConfig, IsExecConfig,
+-                                       AllowRecovery);
++                                       AllowRecovery, IsStdInvoke);
+     }
+   }
+ 
+@@ -6840,7 +6862,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+                             CurFPFeatureOverrides());
+   }
+   return BuildResolvedCallExpr(Fn, NDecl, LParenLoc, ArgExprs, RParenLoc,
+-                               ExecConfig, IsExecConfig);
++                               ExecConfig, IsExecConfig, ADLCallKind::NotADL,
++                               IsStdInvoke);
+ }
+ 
+ /// BuildBuiltinCallExpr - Create a call to a builtin function specified by Id
+@@ -6915,7 +6938,8 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
+                                        SourceLocation LParenLoc,
+                                        ArrayRef<Expr *> Args,
+                                        SourceLocation RParenLoc, Expr *Config,
+-                                       bool IsExecConfig, ADLCallKind UsesADL) {
++                                       bool IsExecConfig, ADLCallKind UsesADL,
++                                       bool IsStdInvoke) {
+   FunctionDecl *FDecl = dyn_cast_or_null<FunctionDecl>(NDecl);
+   unsigned BuiltinID = (FDecl ? FDecl->getBuiltinID() : 0);
+ 
+@@ -7091,7 +7115,7 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
+ 
+   if (Proto) {
+     if (ConvertArgumentsForCall(TheCall, Fn, FDecl, Proto, Args, RParenLoc,
+-                                IsExecConfig))
++                                IsExecConfig, IsStdInvoke))
+       return ExprError();
+   } else {
+     assert(isa<FunctionNoProtoType>(FuncT) && "Unknown FunctionType!");
+@@ -14527,7 +14551,8 @@ static void RecordModifiableNonNullParam(Sema &S, const Expr *Exp) {
+ /// CheckIndirectionOperand - Type check unary indirection (prefix '*').
+ static QualType CheckIndirectionOperand(Sema &S, Expr *Op, ExprValueKind &VK,
+                                         SourceLocation OpLoc,
+-                                        bool IsAfterAmp = false) {
++                                        bool IsAfterAmp = false,
++                                        bool IsStdInvoke = false) {
+   if (Op->isTypeDependent())
+     return S.Context.DependentTy;
+ 
+@@ -14555,12 +14580,13 @@ static QualType CheckIndirectionOperand(Sema &S, Expr *Op, ExprValueKind &VK,
+     ExprResult PR = S.CheckPlaceholderExpr(Op);
+     if (PR.isInvalid()) return QualType();
+     if (PR.get() != Op)
+-      return CheckIndirectionOperand(S, PR.get(), VK, OpLoc);
++      return CheckIndirectionOperand(S, PR.get(), VK, OpLoc, IsAfterAmp, IsStdInvoke);
+   }
+ 
+   if (Result.isNull()) {
+-    S.Diag(OpLoc, diag::err_typecheck_indirection_requires_pointer)
+-      << OpTy << Op->getSourceRange();
++    if (!IsStdInvoke)
++      S.Diag(OpLoc, diag::err_typecheck_indirection_requires_pointer)
++          << OpTy << Op->getSourceRange();
+     return QualType();
+   }
+ 
+@@ -14866,8 +14892,8 @@ static bool needsConversionOfHalfVec(bool OpRequiresConversion, ASTContext &Ctx,
+ /// operator @p Opc at location @c TokLoc. This routine only supports
+ /// built-in operations; ActOnBinOp handles overloaded operators.
+ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
+-                                    BinaryOperatorKind Opc,
+-                                    Expr *LHSExpr, Expr *RHSExpr) {
++                                    BinaryOperatorKind Opc, Expr *LHSExpr,
++                                    Expr *RHSExpr, bool IsStdInvoke) {
+   if (getLangOpts().CPlusPlus11 && isa<InitListExpr>(RHSExpr)) {
+     // The syntax only allows initializer lists on the RHS of assignment,
+     // so we don't need to worry about accepting invalid code for
+@@ -14967,7 +14993,7 @@ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
+   case BO_PtrMemD:
+   case BO_PtrMemI:
+     ResultTy = CheckPointerToMemberOperands(LHS, RHS, VK, OpLoc,
+-                                            Opc == BO_PtrMemI);
++                                            Opc == BO_PtrMemI, IsStdInvoke);
+     break;
+   case BO_Mul:
+   case BO_Div:
+@@ -15380,8 +15406,8 @@ void Sema::LookupBinOp(Scope *S, SourceLocation OpLoc, BinaryOperatorKind Opc,
+ 
+ /// Build an overloaded binary operator expression in the given scope.
+ static ExprResult BuildOverloadedBinOp(Sema &S, Scope *Sc, SourceLocation OpLoc,
+-                                       BinaryOperatorKind Opc,
+-                                       Expr *LHS, Expr *RHS) {
++                                       BinaryOperatorKind Opc, Expr *LHS,
++                                       Expr *RHS, bool IsStdInvoke = false) {
+   switch (Opc) {
+   case BO_Assign:
+   case BO_DivAssign:
+@@ -15403,12 +15429,13 @@ static ExprResult BuildOverloadedBinOp(Sema &S, Scope *Sc, SourceLocation OpLoc,
+ 
+   // Build the (potentially-overloaded, potentially-dependent)
+   // binary operation.
+-  return S.CreateOverloadedBinOp(OpLoc, Opc, Functions, LHS, RHS);
++  return S.CreateOverloadedBinOp(OpLoc, Opc, Functions, LHS, RHS, true, true,
++                                 nullptr, IsStdInvoke);
+ }
+ 
+ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
+-                            BinaryOperatorKind Opc,
+-                            Expr *LHSExpr, Expr *RHSExpr) {
++                            BinaryOperatorKind Opc, Expr *LHSExpr,
++                            Expr *RHSExpr, bool IsStdInvoke) {
+   ExprResult LHS, RHS;
+   std::tie(LHS, RHS) = CorrectDelayedTyposInBinOp(*this, Opc, LHSExpr, RHSExpr);
+   if (!LHS.isUsable() || !RHS.isUsable())
+@@ -15482,7 +15509,7 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
+            LHSExpr->getType()->isOverloadableType()))
+         return BuildOverloadedBinOp(*this, S, OpLoc, Opc, LHSExpr, RHSExpr);
+ 
+-      return CreateBuiltinBinOp(OpLoc, Opc, LHSExpr, RHSExpr);
++      return CreateBuiltinBinOp(OpLoc, Opc, LHSExpr, RHSExpr, IsStdInvoke);
+     }
+ 
+     // Don't resolve overloads if the other type is overloadable.
+@@ -15505,7 +15532,8 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
+     // overloadable type.
+     if (LHSExpr->getType()->isOverloadableType() ||
+         RHSExpr->getType()->isOverloadableType())
+-      return BuildOverloadedBinOp(*this, S, OpLoc, Opc, LHSExpr, RHSExpr);
++      return BuildOverloadedBinOp(*this, S, OpLoc, Opc, LHSExpr, RHSExpr,
++                                  IsStdInvoke);
+   }
+ 
+   if (getLangOpts().RecoveryAST &&
+@@ -15550,7 +15578,7 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
+   }
+ 
+   // Build a built-in binary operation.
+-  return CreateBuiltinBinOp(OpLoc, Opc, LHSExpr, RHSExpr);
++  return CreateBuiltinBinOp(OpLoc, Opc, LHSExpr, RHSExpr, IsStdInvoke);
+ }
+ 
+ static bool isOverflowingIntegerType(ASTContext &Ctx, QualType T) {
+@@ -15565,7 +15593,8 @@ static bool isOverflowingIntegerType(ASTContext &Ctx, QualType T) {
+ 
+ ExprResult Sema::CreateBuiltinUnaryOp(SourceLocation OpLoc,
+                                       UnaryOperatorKind Opc, Expr *InputExpr,
+-                                      bool IsAfterAmp) {
++                                      bool IsAfterAmp,
++                                      bool IsStdInvoke) {
+   ExprResult Input = InputExpr;
+   ExprValueKind VK = VK_PRValue;
+   ExprObjectKind OK = OK_Ordinary;
+@@ -15616,7 +15645,7 @@ ExprResult Sema::CreateBuiltinUnaryOp(SourceLocation OpLoc,
+     Input = DefaultFunctionArrayLvalueConversion(Input.get());
+     if (Input.isInvalid()) return ExprError();
+     resultType =
+-        CheckIndirectionOperand(*this, Input.get(), VK, OpLoc, IsAfterAmp);
++        CheckIndirectionOperand(*this, Input.get(), VK, OpLoc, IsAfterAmp, IsStdInvoke);
+     break;
+   }
+   case UO_Plus:
+@@ -15837,7 +15866,8 @@ bool Sema::isQualifiedMemberAccess(Expr *E) {
+ 
+ ExprResult Sema::BuildUnaryOp(Scope *S, SourceLocation OpLoc,
+                               UnaryOperatorKind Opc, Expr *Input,
+-                              bool IsAfterAmp) {
++                              bool IsAfterAmp,
++                              bool IsStdInvoke) {
+   // First things first: handle placeholders so that the
+   // overloaded-operator check considers the right type.
+   if (const BuiltinType *pty = Input->getType()->getAsPlaceholderType()) {
+@@ -15873,10 +15903,11 @@ ExprResult Sema::BuildUnaryOp(Scope *S, SourceLocation OpLoc,
+     if (S && OverOp != OO_None)
+       LookupOverloadedOperatorName(OverOp, S, Functions);
+ 
+-    return CreateOverloadedUnaryOp(OpLoc, Opc, Functions, Input);
++    return CreateOverloadedUnaryOp(OpLoc, Opc, Functions, Input,
++                                   /*RequiresADL*/ true, IsStdInvoke);
+   }
+ 
+-  return CreateBuiltinUnaryOp(OpLoc, Opc, Input, IsAfterAmp);
++  return CreateBuiltinUnaryOp(OpLoc, Opc, Input, IsAfterAmp, IsStdInvoke);
+ }
+ 
+ // Unary Operators.  'Tok' is the token for the operator.
+diff --git a/clang/lib/Sema/SemaExprCXX.cpp b/clang/lib/Sema/SemaExprCXX.cpp
+index 47712166151d..6d10592b1680 100644
+--- a/clang/lib/Sema/SemaExprCXX.cpp
++++ b/clang/lib/Sema/SemaExprCXX.cpp
+@@ -17,7 +17,9 @@
+ #include "clang/AST/ASTLambda.h"
+ #include "clang/AST/CXXInheritance.h"
+ #include "clang/AST/CharUnits.h"
++#include "clang/AST/DeclBase.h"
+ #include "clang/AST/DeclObjC.h"
++#include "clang/AST/Expr.h"
+ #include "clang/AST/ExprCXX.h"
+ #include "clang/AST/ExprObjC.h"
+ #include "clang/AST/RecursiveASTVisitor.h"
+@@ -26,6 +28,7 @@
+ #include "clang/Basic/AlignedAllocation.h"
+ #include "clang/Basic/DiagnosticSema.h"
+ #include "clang/Basic/PartialDiagnostic.h"
++#include "clang/Basic/SourceLocation.h"
+ #include "clang/Basic/TargetInfo.h"
+ #include "clang/Basic/TokenKinds.h"
+ #include "clang/Basic/TypeTraits.h"
+@@ -5762,6 +5765,182 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
+   llvm_unreachable("Unknown type trait or not implemented");
+ }
+ 
++static ExprResult HandleInvokePointerToMemberFunction(
++    Sema &S, const MemberPointerType *CalleeType, bool,
++    SourceLocation LParenLoc, Expr *F, MultiExprArg Args,
++    SourceLocation RParenLoc) {
++  assert(CalleeType->isMemberFunctionPointer());
++  ExprResult B = S.BuildBinOp(S.getCurScope(), LParenLoc,
++                              BinaryOperatorKind::BO_PtrMemD, Args[0], F, true);
++  if (B.isInvalid()) {
++    return ExprError();
++  }
++
++  return S.BuildCallToMemberFunction(
++      S.getCurScope(), B.get(), LParenLoc, Args.drop_front(), RParenLoc,
++      /*ExecConfig*/ nullptr, /*IsExecConfig*/ false, /*AllowRecovery*/ false,
++      /*IsStdInvoke*/ true);
++}
++
++static ExprResult
++HandleInvokePointerToDataMember(Sema &S, const MemberPointerType *CalleeType,
++                                bool IsInvokeR, SourceLocation LParenLoc,
++                                Expr *F, MultiExprArg Args,
++                                SourceLocation RParenLoc) {
++  return S.BuildBinOp(S.getCurScope(), LParenLoc,
++                      BinaryOperatorKind::BO_PtrMemD, Args[0], F);
++}
++
++static ExprResult
++HandleInvokePointerToMember(Sema &S, const MemberPointerType *CalleeType,
++                            bool IsInvokeR, SourceLocation LParenLoc, Expr *F,
++                            MultiExprArg Args, SourceLocation RParenLoc) {
++  auto *Fn = CalleeType->isMemberFunctionPointer()
++                 ? HandleInvokePointerToMemberFunction
++                 : HandleInvokePointerToDataMember;
++  return Fn(S, CalleeType, IsInvokeR, LParenLoc, F, Args, RParenLoc);
++}
++
++static ExprResult UnwrapReferenceWrapper(Sema &S, QualType &FirstArgType,
++                                         Expr *Arg) {
++  auto *D = dyn_cast<ClassTemplateSpecializationDecl>(
++      FirstArgType.getDesugaredType(S.Context)->getAsRecordDecl());
++  FirstArgType = S.BuiltinAddReference(D->getTemplateArgs().get(0).getAsType(),
++                                       Sema::UTTKind::AddLvalueReference,
++                                       Arg->getExprLoc());
++  return S.BuildCXXNamedCast(Arg->getBeginLoc(), tok::kw_static_cast,
++                             S.Context.getTrivialTypeSourceInfo(FirstArgType),
++                             Arg, {}, Arg->getEndLoc());
++}
++
++static ExprResult HandleInvokePointerToMember(Sema &S, bool IsInvokeR,
++                                              QualType CalleeType,
++                                              SourceLocation LParenLoc, Expr *F,
++                                              MultiExprArg Args,
++                                              SourceLocation RParenLoc) {
++  auto *PtrToMember = CalleeType->getAs<MemberPointerType>();
++  if (Args.size() == 0 ||
++      (Args.size() > 1 && CalleeType->isMemberDataPointerType())) {
++    S.Diag(LParenLoc, diag::err_invoke_pointer_to_member_too_few_args)
++        << PtrToMember->isMemberFunctionPointer() << IsInvokeR << 1;
++    return ExprError();
++  }
++
++  QualType FirstArgType = Args[0]->getType();
++  QualType ClassType = QualType(PtrToMember->getClass(), 0);
++  bool IsBase = EvaluateBinaryTypeTrait(S, TypeTrait::BTT_IsBaseOf, ClassType,
++                                        FirstArgType.getNonReferenceType(), {});
++  if (IsBase)
++    return HandleInvokePointerToMember(S, PtrToMember, IsInvokeR, LParenLoc, F,
++                                       Args, RParenLoc);
++
++  if (RecordDecl *D = FirstArgType->getAsCXXRecordDecl()) {
++    bool IsReferenceWrapper =
++        D->isInStdNamespace() && D->getName() == "reference_wrapper";
++    if (IsReferenceWrapper) {
++      Args[0] = UnwrapReferenceWrapper(S, FirstArgType, Args[0]).get();
++      FirstArgType = Args[0]->getType();
++    }
++
++    IsBase = EvaluateBinaryTypeTrait(S, TypeTrait::BTT_IsBaseOf, ClassType,
++                                     FirstArgType, {});
++    if (IsBase)
++      return HandleInvokePointerToMember(S, PtrToMember, IsInvokeR, LParenLoc,
++                                         F, Args, RParenLoc);
++
++    if (IsReferenceWrapper) {
++      S.Diag(F->getBeginLoc(),
++             diag::err_invoke_pointer_to_member_incompatible_second_arg)
++          << CalleeType->isMemberFunctionPointerType() << 1
++          << PtrToMember->getClass()->getAsRecordDecl() << FirstArgType;
++      return ExprError();
++    }
++  }
++
++  ExprResult Deref = S.BuildUnaryOp(S.getCurScope(), LParenLoc,
++                                    UnaryOperatorKind::UO_Deref, Args[0], false, true);
++  if (Deref.isInvalid()) {
++    S.Diag(F->getBeginLoc(),
++           diag::err_invoke_pointer_to_member_incompatible_second_arg)
++        << CalleeType->isMemberFunctionPointerType() << 0
++        << PtrToMember->getClass()->getAsCXXRecordDecl() << FirstArgType;
++    return ExprError();
++  }
++
++  Args[0] = Deref.get();
++  IsBase = EvaluateBinaryTypeTrait(S, TypeTrait::BTT_IsBaseOf, ClassType,
++                                   Args[0]->getType(), {});
++  if (!IsBase) {
++    S.Diag(LParenLoc,
++           diag::err_invoke_pointer_to_member_incompatible_second_arg)
++        << PtrToMember->isMemberFunctionPointer() << 2
++        << PtrToMember->getClass()->getAsCXXRecordDecl() << FirstArgType;
++    return ExprError();
++  }
++
++  return HandleInvokePointerToMember(S, PtrToMember, IsInvokeR, LParenLoc, F,
++                                     Args, RParenLoc);
++}
++
++static ExprResult HandleInvoke(Sema &S, CallExpr *TheCall, bool IsInvokeR) {
++  Expr *F = TheCall->getArgs()[0];
++  QualType CalleeType = F->getType();
++  MultiExprArg Args(TheCall->getArgs() + 1, TheCall->getNumArgs() - 1);
++
++  // FIXME: remove this comment block once notes are addressed.
++  // Reviewer note 1: It really feels like there should be some way to use
++  // Context.getSubstTemplateTypeParmType, but it's not clear what the second
++  // argument should be.
++  // Reviewer note 2: Do we need to consider SubstTemplateTypeParmPackType too?
++  if (auto *T = dyn_cast<SubstTemplateTypeParmType>(CalleeType))
++    CalleeType = T->getReplacementType();
++
++  if (!CalleeType->isMemberPointerType()) {
++    return S.BuildCallExpr(S.getCurScope(), F, TheCall->getBeginLoc(), Args,
++                           TheCall->getEndLoc(), /*ExecConfig*/ nullptr,
++                           /*IsExecConfig*/ false, /*AllowRecovery*/ false,
++                           /*IsStdInvoke*/ true);
++  }
++
++  return HandleInvokePointerToMember(S, IsInvokeR, CalleeType,
++                                     TheCall->getBeginLoc(), F, Args,
++                                     TheCall->getEndLoc());
++}
++
++ExprResult Sema::BuildStdInvokeCall(CallExpr *TheCall, FunctionDecl *FDecl,
++                                    unsigned int BuiltinID) {
++  assert(TheCall->getNumArgs() > 0);
++
++  ExprResult Result =
++      HandleInvoke(*this, TheCall, BuiltinID == Builtin::BIinvoke_r);
++  if (BuiltinID == Builtin::BIinvoke || Result.isInvalid())
++    return Result;
++
++  QualType ResultType = Result.get()->getType();
++  QualType InvokeRType = FDecl->getReturnType();
++  if (!EvaluateBinaryTypeTrait(*this, TypeTrait::BTT_IsConvertibleTo,
++                               ResultType, InvokeRType, {})) {
++    QualType T = TheCall->getArgs()[0]->getType();
++    unsigned Kind = T->isRecordType() ? 4 // function object
++                    : T->isMemberFunctionPointerType()
++                        ? 3 // pointer-to-member function
++                    : T->isMemberDataPointerType() ? 2 // pointer-to-data member
++                    : T->isBlockPointerType()      ? 1 // block
++                                                   : 0;     // function
++    SemaDiagnosticBuilder B =
++        Diag(TheCall->getBeginLoc(), diag::err_invoke_bad_conversion)
++        << Kind << ResultType << InvokeRType;
++    if (T->isRecordType())
++      B << T;
++    return ExprError();
++  }
++
++  return BuildCXXNamedCast(TheCall->getBeginLoc(), tok::kw_static_cast,
++                           Context.getTrivialTypeSourceInfo(InvokeRType),
++                           Result.get(), TheCall->getBeginLoc(),
++                           TheCall->getBeginLoc());
++}
++
+ ExprResult Sema::ActOnArrayTypeTrait(ArrayTypeTrait ATT,
+                                      SourceLocation KWLoc,
+                                      ParsedType Ty,
+@@ -5893,8 +6072,8 @@ ExprResult Sema::BuildExpressionTrait(ExpressionTrait ET,
+ 
+ QualType Sema::CheckPointerToMemberOperands(ExprResult &LHS, ExprResult &RHS,
+                                             ExprValueKind &VK,
+-                                            SourceLocation Loc,
+-                                            bool isIndirect) {
++                                            SourceLocation Loc, bool isIndirect,
++                                            bool IsStdInvoke) {
+   assert(!LHS.get()->hasPlaceholderType() && !RHS.get()->hasPlaceholderType() &&
+          "placeholders should have been weeded out by now");
+ 
+@@ -6012,16 +6191,28 @@ QualType Sema::CheckPointerToMemberOperands(ExprResult &LHS, ExprResult &RHS,
+           Diag(Loc, getLangOpts().CPlusPlus20
+                         ? diag::warn_cxx17_compat_pointer_to_const_ref_member_on_rvalue
+                         : diag::ext_pointer_to_const_ref_member_on_rvalue);
+-        else
++        else if (!IsStdInvoke)
+           Diag(Loc, diag::err_pointer_to_member_oper_value_classify)
+               << RHSType << 1 << LHS.get()->getSourceRange();
++        else {
++          Diag(Loc, diag::err_invoke_pointer_to_member_ref_qualifiers)
++              << RHS.get() << 0;
++          return QualType();
++        }
+       }
+       break;
+ 
+     case RQ_RValue:
+-      if (isIndirect || !LHS.get()->Classify(Context).isRValue())
+-        Diag(Loc, diag::err_pointer_to_member_oper_value_classify)
+-          << RHSType << 0 << LHS.get()->getSourceRange();
++      if (isIndirect || !LHS.get()->Classify(Context).isRValue()) {
++        if (!IsStdInvoke)
++          Diag(Loc, diag::err_pointer_to_member_oper_value_classify)
++              << RHSType << 0 << LHS.get()->getSourceRange();
++        else {
++          Diag(Loc, diag::err_invoke_pointer_to_member_ref_qualifiers)
++              << RHS.get() << 1;
++          return QualType();
++        }
++      }
+       break;
+     }
+   }
+diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
+index d3f6d1b256c5..b71a30ac8925 100644
+--- a/clang/lib/Sema/SemaOverload.cpp
++++ b/clang/lib/Sema/SemaOverload.cpp
+@@ -53,11 +53,13 @@ static bool functionHasPassObjectSizeParams(const FunctionDecl *FD) {
+ }
+ 
+ /// A convenience routine for creating a decayed reference to a function.
+-static ExprResult CreateFunctionRefExpr(
+-    Sema &S, FunctionDecl *Fn, NamedDecl *FoundDecl, const Expr *Base,
+-    bool HadMultipleCandidates, SourceLocation Loc = SourceLocation(),
+-    const DeclarationNameLoc &LocInfo = DeclarationNameLoc()) {
+-  if (S.DiagnoseUseOfDecl(FoundDecl, Loc))
++static ExprResult
++CreateFunctionRefExpr(Sema &S, FunctionDecl *Fn, NamedDecl *FoundDecl,
++                      const Expr *Base, bool HadMultipleCandidates,
++                      SourceLocation Loc = SourceLocation(),
++                      const DeclarationNameLoc &LocInfo = DeclarationNameLoc(),
++                      bool IsStdInvoke = false) {
++  if (S.DiagnoseUseOfDecl(FoundDecl, Loc, {}, {}, {}, {}, {}, IsStdInvoke))
+     return ExprError();
+   // If FoundDecl is different from Fn (such as if one is a template
+   // and the other a specialization), make sure DiagnoseUseOfDecl is
+@@ -6510,7 +6512,7 @@ void Sema::AddOverloadCandidate(
+       NamedDecl *ND = Function;
+       if (auto *SpecInfo = Function->getTemplateSpecializationInfo())
+         ND = SpecInfo->getTemplate();
+-      
++
+       if (ND->getFormalLinkage() == Linkage::InternalLinkage) {
+         Candidate.Viable = false;
+         Candidate.FailureKind = ovl_fail_module_mismatched;
+@@ -13522,10 +13524,11 @@ ExprResult Sema::CreateUnresolvedLookupExpr(CXXRecordDecl *NamingClass,
+ /// by CreateOverloadedUnaryOp().
+ ///
+ /// \param Input The input argument.
+-ExprResult
+-Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
+-                              const UnresolvedSetImpl &Fns,
+-                              Expr *Input, bool PerformADL) {
++ExprResult Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc,
++                                         UnaryOperatorKind Opc,
++                                         const UnresolvedSetImpl &Fns,
++                                         Expr *Input, bool PerformADL,
++                                         bool IsStdInvoke) {
+   OverloadedOperatorKind Op = UnaryOperator::getOverloadedOperator(Opc);
+   assert(Op != OO_None && "Invalid opcode for overloaded unary operator");
+   DeclarationName OpName = Context.DeclarationNames.getCXXOperatorName(Op);
+@@ -13695,7 +13698,7 @@ Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
+   // Either we found no viable overloaded operator or we matched a
+   // built-in operator. In either case, fall through to trying to
+   // build a built-in operation.
+-  return CreateBuiltinUnaryOp(OpLoc, Opc, Input);
++  return CreateBuiltinUnaryOp(OpLoc, Opc, Input, false, IsStdInvoke);
+ }
+ 
+ /// Perform lookup for an overloaded binary operator.
+@@ -13785,12 +13788,11 @@ void Sema::LookupOverloadedBinOp(OverloadCandidateSet &CandidateSet,
+ ///        the function in question. Such a function is never a candidate in
+ ///        our overload resolution. This also enables synthesizing a three-way
+ ///        comparison from < and == as described in C++20 [class.spaceship]p1.
+-ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+-                                       BinaryOperatorKind Opc,
+-                                       const UnresolvedSetImpl &Fns, Expr *LHS,
+-                                       Expr *RHS, bool PerformADL,
+-                                       bool AllowRewrittenCandidates,
+-                                       FunctionDecl *DefaultedFn) {
++ExprResult
++Sema::CreateOverloadedBinOp(SourceLocation OpLoc, BinaryOperatorKind Opc,
++                            const UnresolvedSetImpl &Fns, Expr *LHS, Expr *RHS,
++                            bool PerformADL, bool AllowRewrittenCandidates,
++                            FunctionDecl *DefaultedFn, bool IsStdInvoke) {
+   Expr *Args[2] = { LHS, RHS };
+   LHS=RHS=nullptr; // Please use only Args instead of LHS/RHS couple
+ 
+@@ -13846,12 +13848,12 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+   // problems. So we do it this way, which pretty much follows what GCC does.
+   // Note that we go the traditional code path for compound assignment forms.
+   if (Opc == BO_Assign && !Args[0]->getType()->isOverloadableType())
+-    return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1]);
++    return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1], IsStdInvoke);
+ 
+   // If this is the .* operator, which is not overloadable, just
+   // create a built-in binary operator.
+   if (Opc == BO_PtrMemD)
+-    return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1]);
++    return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1], IsStdInvoke);
+ 
+   // Build the overload set.
+   OverloadCandidateSet CandidateSet(OpLoc, OverloadCandidateSet::CSK_Operator,
+@@ -13932,8 +13934,8 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+               Diag(FnDecl->getLocation(),
+                    diag::note_ovl_ambiguous_oper_binary_reversed_self);
+               // Mark member== const or provide matching != to disallow reversed
+-              // args. Eg. 
+-              // struct S { bool operator==(const S&); }; 
++              // args. Eg.
++              // struct S { bool operator==(const S&); };
+               // S()==S();
+               if (auto *MD = dyn_cast<CXXMethodDecl>(FnDecl))
+                 if (Op == OverloadedOperatorKind::OO_EqualEqual &&
+@@ -14153,7 +14155,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+ 
+         // No viable function; try to create a built-in operation, which will
+         // produce an error. Then, show the non-viable candidates.
+-        Result = CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1]);
++        Result = CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1], IsStdInvoke);
+       }
+       assert(Result.isInvalid() &&
+              "C++ binary operator overloading is missing candidates!");
+@@ -14204,7 +14206,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+   }
+ 
+   // We matched a built-in operator; build it.
+-  return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1]);
++  return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1], IsStdInvoke);
+ }
+ 
+ ExprResult Sema::BuildSynthesizedThreeWayComparison(
+@@ -14519,12 +14521,10 @@ ExprResult Sema::CreateOverloadedArraySubscriptExpr(SourceLocation LLoc,
+ /// parameter). The caller needs to validate that the member
+ /// expression refers to a non-static member function or an overloaded
+ /// member function.
+-ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+-                                           SourceLocation LParenLoc,
+-                                           MultiExprArg Args,
+-                                           SourceLocation RParenLoc,
+-                                           Expr *ExecConfig, bool IsExecConfig,
+-                                           bool AllowRecovery) {
++ExprResult Sema::BuildCallToMemberFunction(
++    Scope *S, Expr *MemExprE, SourceLocation LParenLoc, MultiExprArg Args,
++    SourceLocation RParenLoc, Expr *ExecConfig, bool IsExecConfig,
++    bool AllowRecovery, bool IsStdInvoke) {
+   assert(MemExprE->getType() == Context.BoundMemberTy ||
+          MemExprE->getType() == Context.OverloadTy);
+ 
+@@ -14558,10 +14558,16 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+     difference.removeAddressSpace();
+     if (difference) {
+       std::string qualsString = difference.getAsString();
+-      Diag(LParenLoc, diag::err_pointer_to_member_call_drops_quals)
+-        << fnType.getUnqualifiedType()
+-        << qualsString
+-        << (qualsString.find(' ') == std::string::npos ? 1 : 2);
++      if (!IsStdInvoke)
++          Diag(LParenLoc, diag::err_pointer_to_member_call_drops_quals)
++              << fnType.getUnqualifiedType() << qualsString
++              << (qualsString.find(' ') == std::string::npos ? 1 : 2);
++      else {
++          Diag(LParenLoc, diag::err_invoke_pointer_to_member_drops_qualifiers)
++              << op->getRHS() << qualsString
++              << (qualsString.find(' ') == std::string::npos ? 1 : 2);
++          return ExprError();
++      }
+     }
+ 
+     CXXMemberCallExpr *call = CXXMemberCallExpr::Create(
+@@ -14572,7 +14578,8 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+                             call, nullptr))
+       return ExprError();
+ 
+-    if (ConvertArgumentsForCall(call, op, nullptr, proto, Args, RParenLoc))
++    if (ConvertArgumentsForCall(call, op, nullptr, proto, Args, RParenLoc,
++                                false, IsStdInvoke))
+       return ExprError();
+ 
+     if (CheckOtherCall(call, proto))
+@@ -14815,11 +14822,11 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+ /// type (C++ [over.call.object]), which can end up invoking an
+ /// overloaded function call operator (@c operator()) or performing a
+ /// user-defined conversion on the object argument.
+-ExprResult
+-Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+-                                   SourceLocation LParenLoc,
+-                                   MultiExprArg Args,
+-                                   SourceLocation RParenLoc) {
++ExprResult Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
++                                              SourceLocation LParenLoc,
++                                              MultiExprArg Args,
++                                              SourceLocation RParenLoc,
++                                              bool IsStdInvoke) {
+   if (checkPlaceholderForOverload(*this, Obj))
+     return ExprError();
+   ExprResult Object = Obj;
+@@ -14908,6 +14915,8 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+ 
+   // Perform overload resolution.
+   OverloadCandidateSet::iterator Best;
++  QualType T = Object.get()->getType();
++  SourceRange SR = Object.get()->getSourceRange();
+   switch (CandidateSet.BestViableFunction(*this, Object.get()->getBeginLoc(),
+                                           Best)) {
+   case OR_Success:
+@@ -14918,32 +14927,33 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+   case OR_No_Viable_Function: {
+     PartialDiagnostic PD =
+         CandidateSet.empty()
+-            ? (PDiag(diag::err_ovl_no_oper)
+-               << Object.get()->getType() << /*call*/ 1
+-               << Object.get()->getSourceRange())
+-            : (PDiag(diag::err_ovl_no_viable_object_call)
+-               << Object.get()->getType() << Object.get()->getSourceRange());
++            ? (PDiag(diag::err_ovl_no_oper) << T << /*call*/ 1 << SR)
++        : !IsStdInvoke ? (PDiag(diag::err_ovl_no_viable_object_call) << T << SR)
++                       : (PDiag(diag::err_invoke_function_object)
++                          << T << /*no*/ 0 << 1 << SR);
+     CandidateSet.NoteCandidates(
+         PartialDiagnosticAt(Object.get()->getBeginLoc(), PD), *this,
+         OCD_AllCandidates, Args);
+     break;
+   }
+-  case OR_Ambiguous:
++  case OR_Ambiguous: {
++    PartialDiagnostic PD =
++        !IsStdInvoke ? (PDiag(diag::err_ovl_ambiguous_object_call) << T << SR)
++                     : (PDiag(diag::err_invoke_function_object)
++                        << T << /*plural*/ 1 << CandidateSet.size() << 2 << SR);
+     CandidateSet.NoteCandidates(
+-        PartialDiagnosticAt(Object.get()->getBeginLoc(),
+-                            PDiag(diag::err_ovl_ambiguous_object_call)
+-                                << Object.get()->getType()
+-                                << Object.get()->getSourceRange()),
+-        *this, OCD_AmbiguousCandidates, Args);
++        PartialDiagnosticAt(Object.get()->getBeginLoc(), PD), *this,
++        OCD_AmbiguousCandidates, Args);
+     break;
+-
++  }
+   case OR_Deleted:
++    PartialDiagnostic PD =
++        !IsStdInvoke
++            ? PDiag(diag::err_ovl_deleted_object_call) << T << SR
++            : PDiag(diag::err_invoke_function_object_deleted) << 2 << T << SR;
+     CandidateSet.NoteCandidates(
+-        PartialDiagnosticAt(Object.get()->getBeginLoc(),
+-                            PDiag(diag::err_ovl_deleted_object_call)
+-                                << Object.get()->getType()
+-                                << Object.get()->getSourceRange()),
+-        *this, OCD_AllCandidates, Args);
++        PartialDiagnosticAt(Object.get()->getBeginLoc(), PD), *this,
++        OCD_AllCandidates, Args);
+     break;
+   }
+ 
+@@ -15000,10 +15010,9 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+   DeclarationNameInfo OpLocInfo(
+                Context.DeclarationNames.getCXXOperatorName(OO_Call), LParenLoc);
+   OpLocInfo.setCXXOperatorNameRange(SourceRange(LParenLoc, RParenLoc));
+-  ExprResult NewFn = CreateFunctionRefExpr(*this, Method, Best->FoundDecl,
+-                                           Obj, HadMultipleCandidates,
+-                                           OpLocInfo.getLoc(),
+-                                           OpLocInfo.getInfo());
++  ExprResult NewFn = CreateFunctionRefExpr(
++      *this, Method, Best->FoundDecl, Obj, HadMultipleCandidates,
++      OpLocInfo.getLoc(), OpLocInfo.getInfo(), IsStdInvoke);
+   if (NewFn.isInvalid())
+     return true;
+ 
+diff --git a/clang/test/SemaCXX/builtin-std-invoke.cpp b/clang/test/SemaCXX/builtin-std-invoke.cpp
+new file mode 100644
+index 000000000000..cafda54f04b8
+--- /dev/null
++++ b/clang/test/SemaCXX/builtin-std-invoke.cpp
+@@ -0,0 +1,496 @@
++// RUN: %clang_cc1 -fsyntax-only -std=c++17 -verify %s
++
++namespace std {
++template <class F, class... Args>
++void invoke(F &&, Args &&...); // expected-note{{requires at least 1 argument, but 0 were provided}}
++
++template <class R, class F, class... Args>
++R invoke_r(F &&, Args &&...); // expected-note{{requires at least 1 argument, but 0 were provided}}
++
++// Slightly different to the real deal to simplify test.
++template <class T>
++class reference_wrapper {
++public:
++  constexpr reference_wrapper(T &t) : data(&t) {}
++
++  constexpr operator T &() const noexcept { return *data; }
++
++private:
++  T *data;
++};
++} // namespace std
++
++#define assert(...)   \
++  if (!(__VA_ARGS__)) \
++    __builtin_unreachable();
++
++struct ThrowingInt {
++  constexpr ThrowingInt(int x) : value(x) {}
++
++  int value;
++};
++
++template <class Returns, bool IsNoexcept, int ExpectedResult, class F, class T, class... Args>
++constexpr void bullet_1(F f, T &&t, Args... args) {
++  assert(std::invoke(f, static_cast<T &&>(t), args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke(f, static_cast<T &&>(t), args...)), Returns));
++  static_assert(noexcept(std::invoke(f, static_cast<T &&>(t), args...)) == IsNoexcept);
++
++  assert(std::invoke_r<double>(f, static_cast<T &&>(t), args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, static_cast<T &&>(t), args...)), double));
++  static_assert(noexcept(std::invoke_r<double>(f, static_cast<T &&>(t), args...)) == IsNoexcept);
++
++  assert(std::invoke_r<ThrowingInt>(f, static_cast<T &&>(t), args...).value == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, static_cast<T &&>(t), args...)), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, static_cast<T &&>(t), args...)));
++}
++
++template <class Returns, bool IsNoexcept, int ExpectedResult, class F, class T, class... Args>
++constexpr void bullet_2(F f, T &t, Args... args) {
++  std::reference_wrapper<T> rw(t);
++  assert(std::invoke(f, rw, args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke(f, rw, args...)), Returns));
++  static_assert(noexcept(std::invoke(f, rw, args...)) == IsNoexcept);
++
++  assert(std::invoke_r<double>(f, rw, args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, rw, args...)), double));
++  static_assert(noexcept(std::invoke_r<double>(f, rw, args...)) == IsNoexcept);
++
++  assert(std::invoke_r<ThrowingInt>(f, rw, args...).value == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, rw, args...)), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, rw, args...)));
++}
++
++template <class T>
++class PointerWrapper {
++public:
++  constexpr explicit PointerWrapper(T &t) noexcept : p(&t) {}
++
++  constexpr T &operator*() const noexcept { return *p; }
++
++private:
++  T *p;
++};
++
++template <class Returns, bool IsNoexcept, int ExpectedResult, class F, class T, class... Args>
++constexpr void bullet_3(F f, T &t, Args... args) {
++  assert(std::invoke(f, &t, args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke(f, &t, args...)), Returns));
++  static_assert(noexcept(std::invoke(f, &t, args...)) == IsNoexcept);
++
++  assert(std::invoke(f, PointerWrapper(t), args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke(f, PointerWrapper(t), args...)), Returns));
++  static_assert(noexcept(std::invoke(f, PointerWrapper(t), args...)) == IsNoexcept);
++
++  assert(std::invoke_r<double>(f, &t, args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, &t, args...)), double));
++  static_assert(noexcept(std::invoke_r<double>(f, &t, args...)) == IsNoexcept);
++
++  assert(std::invoke_r<double>(f, PointerWrapper(t), args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, PointerWrapper(t), args...)), double));
++  static_assert(noexcept(std::invoke_r<double>(f, PointerWrapper(t), args...)) == IsNoexcept);
++
++  assert(std::invoke_r<ThrowingInt>(f, &t, args...).value == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, &t, args...)), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, &t, args...)));
++
++  assert(std::invoke_r<ThrowingInt>(f, PointerWrapper(t), args...).value == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, PointerWrapper(t), args...)), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, PointerWrapper(t), args...)));
++}
++
++template <class T>
++constexpr bool bullets_1_through_3(T t) {
++  bullet_1</*Returns=*/int &, /*IsNoexcept=*/true, /*ExpectedResult=*/0>(&T::plus, t, 3, -3);
++  bullet_1</*Returns=*/const int &, /*IsNoexcept=*/true, /*ExpectedResult=*/-4>(&T::minus, static_cast<const T &>(t), 1, 2, 3);
++  bullet_1</*Returns=*/int &&, /*IsNoexcept=*/false, /*ExpectedResult=*/49>(&T::square, static_cast<__remove_reference_t(T) &&>(t), 7);
++  bullet_1</*Returns=*/const int &&, /*IsNoexcept=*/false, /*ExpectedResult=*/-63>(&T::sum, static_cast<const T &&>(t), -1, -2, -4, -8, -16, -32);
++
++  bullet_2</*Returns=*/int &, /*IsNoexcept=*/true, /*ExpectedResult=*/0>(&T::plus, t, 3, -3);
++  bullet_2</*Returns=*/const int &, /*IsNoexcept=*/true, /*ExpectedResult=*/-4>(&T::minus, static_cast<const T &>(t), 1, 2, 3);
++
++  bullet_3</*Returns=*/int &, /*IsNoexcept=*/true, /*ExpectedResult=*/0>(&T::plus, t, 3, -3);
++  bullet_3</*Returns=*/const int &, /*IsNoexcept=*/true, /*ExpectedResult=*/-4>(&T::minus, static_cast<const T &>(t), 1, 2, 3);
++
++  return true;
++}
++
++template <class Returns, class F, class T, class U>
++constexpr void bullet_4(F f, T &&t, U ExpectedResult) {
++  assert(std::invoke(f, static_cast<T &&>(t)) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke(f, static_cast<T &&>(t))), Returns));
++  static_assert(noexcept(std::invoke(f, static_cast<T &&>(t))));
++
++  assert(std::invoke_r<double>(f, static_cast<T &&>(t)) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, static_cast<T &&>(t))), double));
++  static_assert(noexcept(std::invoke_r<double>(f, static_cast<T &&>(t))));
++
++  assert(std::invoke_r<ThrowingInt>(f, static_cast<T &&>(t)).value == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, static_cast<T &&>(t))), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, static_cast<T &&>(t))));
++}
++
++template <class Returns, class F, class T, class U>
++constexpr void bullet_5(F f, T &t, U ExpectedResult) {
++  std::reference_wrapper<T> rw(t);
++  assert(std::invoke(f, rw) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke(f, rw)), Returns));
++  static_assert(noexcept(std::invoke(f, rw)));
++
++  assert(std::invoke_r<double>(f, rw) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, rw)), double));
++  static_assert(noexcept(std::invoke_r<double>(f, rw)));
++
++  assert(std::invoke_r<ThrowingInt>(f, rw).value == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, rw)), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, rw)));
++}
++
++template <class Returns, class F, class T, class U>
++constexpr void bullet_6(F f, T &t, U ExpectedResult) {
++  assert(std::invoke(f, &t) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke(f, &t)), Returns));
++  static_assert(noexcept(std::invoke(f, &t)));
++
++  assert(std::invoke(f, PointerWrapper(t)) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke(f, PointerWrapper(t))), Returns));
++  static_assert(noexcept(std::invoke(f, PointerWrapper(t))));
++
++  assert(std::invoke_r<double>(f, &t) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, &t)), double));
++  static_assert(noexcept(std::invoke_r<double>(f, &t)));
++
++  assert(std::invoke_r<double>(f, PointerWrapper(t)) == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, PointerWrapper(t))), double));
++  static_assert(noexcept(std::invoke_r<double>(f, PointerWrapper(t))));
++
++  assert(std::invoke_r<ThrowingInt>(f, &t).value == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, &t)), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, &t)));
++
++  assert(std::invoke_r<ThrowingInt>(f, PointerWrapper(t)).value == ExpectedResult);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, PointerWrapper(t))), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, PointerWrapper(t))));
++}
++
++template <class F, class T, class U>
++constexpr bool bullets_4_through_6(F f, T t, U ExpectedResult) {
++  bullet_4</*Returns=*/U &>(f, t, ExpectedResult);
++  bullet_4</*Returns=*/const U &>(f, static_cast<const T &>(t), ExpectedResult);
++  bullet_4</*Returns=*/U &&>(f, static_cast<T &&>(t), ExpectedResult);
++  bullet_4</*Returns=*/const U &&>(f, static_cast<const T &&>(t), ExpectedResult);
++
++  bullet_5</*Returns=*/U &>(f, t, ExpectedResult);
++  bullet_5</*Returns=*/const U &>(f, static_cast<const T &>(t), ExpectedResult);
++
++  bullet_6</*Returns=*/U &>(f, t, ExpectedResult);
++  bullet_6</*Returns=*/const U &>(f, static_cast<const T &>(t), ExpectedResult);
++
++  return true;
++}
++
++constexpr int zero() { return 0; }
++constexpr int square(int x) { return x * x; } // expected-note 4 {{'square' declared here}}
++constexpr double product(double x, double y) { return x * y; }
++
++struct summation {
++  template <class... Ts>
++  constexpr auto operator()(Ts... ts) {
++    return (ts + ...);
++  }
++};
++
++struct callable {
++  int x;
++
++  constexpr int &operator()() &noexcept { return x; }                                          // expected-note 2 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
++  constexpr const int &operator()() const &noexcept { return x; }                              // expected-note 2 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
++  constexpr int &&operator()() &&noexcept { return static_cast<int &&>(x); }                   // expected-note 2 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
++  constexpr const int &&operator()() const &&noexcept { return static_cast<const int &&>(x); } // expected-note 2 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
++};
++
++template <class T, auto expected, bool IsNoexcept, class F, class... Args>
++constexpr bool bullet_7(F &&f, Args &&...args) {
++  assert(std::invoke(static_cast<F>(f), static_cast<Args>(args)...) == expected);
++  static_assert(__is_same(decltype(std::invoke(static_cast<F>(f), static_cast<Args>(args)...)), T));
++  static_assert(noexcept(std::invoke(static_cast<F>(f), static_cast<Args>(args)...)) == IsNoexcept);
++
++  assert(std::invoke_r<double>(f, args...) == expected);
++  static_assert(__is_same(decltype(std::invoke_r<double>(f, args...)), double));
++  static_assert(noexcept(std::invoke_r<double>(f, args...)) == IsNoexcept);
++
++  assert(std::invoke_r<ThrowingInt>(f, args...).value == expected);
++  static_assert(__is_same(decltype(std::invoke_r<ThrowingInt>(f, args...)), ThrowingInt));
++  static_assert(!noexcept(std::invoke_r<ThrowingInt>(f, args...)));
++
++  return true;
++}
++
++template <class T, class Expected>
++constexpr bool bullet_7_1() {
++  callable c{21};
++  return std::invoke(static_cast<T>(c)) == 21 &&
++         __is_same(decltype(std::invoke(static_cast<T>(c))), Expected) &&noexcept(std::invoke(static_cast<T>(c)));
++}
++
++struct Base {
++  mutable int data;
++
++  constexpr int &plus(int x, int y) &noexcept {
++    data = x + y;
++    return data;
++  }
++
++  constexpr const int &minus(int x, int y, int z) const &noexcept {
++    data = x - y - z;
++    return data;
++  }
++
++  constexpr int &&square(int x) && {
++    data = x * x;
++    return static_cast<int &&>(data);
++  }
++
++  constexpr const int &&sum(int a, int b, int c, int d, int e, int f) const && {
++    data = a + b + c + d + e + f;
++    return static_cast<const int &&>(data);
++  }
++};
++
++struct Derived : Base {
++  double data2;
++};
++
++void test_invoke() {
++  static_assert(bullets_1_through_3(Base{}));
++  static_assert(bullets_1_through_3(Derived{}));
++
++  static_assert(bullets_4_through_6(&Base::data, Base{21}, 21));
++  static_assert(bullets_4_through_6(&Base::data, Derived{-96, 18}, -96));
++  static_assert(bullets_4_through_6(&Derived::data2, Derived{21, 34}, 34.0));
++
++  static_assert(bullet_7<int, 0, false>(zero));
++  static_assert(bullet_7<int, 25, false>(square, 5.0));
++  static_assert(bullet_7<double, 9, false>(product, 9, 1));
++  static_assert(bullet_7<int, 0, false>(&zero));
++  static_assert(bullet_7<long, 55L, false>(summation{}, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10L));
++  static_assert(bullet_7<int, 18, false>([] { return 18; }));
++
++  static_assert(bullet_7_1<callable &, int &>());
++  static_assert(bullet_7_1<const callable &, const int &>());
++  static_assert(bullet_7_1<callable &&, int &&>());
++  static_assert(bullet_7_1<const callable &&, const int &&>());
++}
++
++struct Ambiguous {
++  int operator()(int) const;           // expected-note 2 {{candidate function}}
++  long operator()(unsigned int) const; // expected-note 2 {{candidate function}}
++};
++
++struct Deleted {
++  int operator()() const = delete; // expected-note 2 {{candidate function has been explicitly deleted}}
++};
++
++int deleted_function() = delete; // expected-note 2 {{'deleted_function' has been explicitly marked deleted here}}
++
++struct Incompatible {};
++
++void test_errors() {
++  // TODO: add cases for bullets 1--6 where 2nd param is an int
++  std::invoke();        // expected-error{{no matching function for call to 'invoke'}}
++  std::invoke_r<int>(); // expected-error{{no matching function for call to 'invoke_r'}}
++
++  { // Concerning bullet 1
++    std::invoke(&Base::plus);
++    // expected-error@-1{{can't invoke pointer-to-member function: 'std::invoke' must have at least 2 arguments for a pointer-to-member function, got 1}}
++    std::invoke_r<double>(&Base::plus);
++    // expected-error@-1{{can't invoke pointer-to-member function: 'std::invoke_r' must have at least 2 arguments for a pointer-to-member function, got 1}}
++    std::invoke(&Base::plus, Incompatible{}, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
++    std::invoke_r<double>(&Base::plus, Incompatible{}, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
++
++    std::invoke(&Base::sum, Base{}, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 1}}
++    std::invoke_r<double>(&Base::sum, Base{}, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 1}}
++
++    std::invoke(&Base::sum, Base{}, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 10}}
++    std::invoke_r<double>(&Base::sum, Base{}, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 10}}
++
++    std::invoke_r<void *>(&Base::sum, Base{}, 0, 1, 2, 3, 4, 5);
++    // expected-error@-1{{can't invoke pointer-to-member function: return type 'const int' isn't convertible to 'void *'}}
++
++    const Base cb;
++    std::invoke(&Base::plus, cb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const' qualifier}}
++    std::invoke_r<double>(&Base::plus, cb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const' qualifier}}
++
++    volatile Base vb;
++    std::invoke(&Base::plus, vb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'volatile' qualifier}}
++    std::invoke_r<double>(&Base::plus, vb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'volatile' qualifier}}
++
++    const volatile Base cvb;
++    std::invoke(&Base::plus, cvb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const volatile' qualifiers}}
++    std::invoke_r<double>(&Base::plus, cvb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const volatile' qualifiers}}
++
++    std::invoke(&Base::plus, Base{}, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' can only be called on an lvalue}}
++    std::invoke_r<double>(&Base::plus, Base{}, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' can only be called on an lvalue}}
++
++    std::invoke(&Base::sum, cb, 1, 2, 3, 4, 5, 6);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::sum' can only be called on an rvalue}}
++    std::invoke_r<double>(&Base::sum, cb, 1, 2, 3, 4, 5, 6);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::sum' can only be called on an rvalue}}
++  }
++  { // Concerning bullet 2
++    Base b;
++    std::reference_wrapper<Base> rw(b);
++
++    Incompatible p;
++    std::reference_wrapper<Incompatible> pw(p);
++
++    std::invoke(&Base::plus, pw, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
++    std::invoke_r<double>(&Base::plus, pw, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
++
++    std::invoke(&Base::plus, rw, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
++    std::invoke_r<double>(&Base::plus, rw, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
++
++    std::invoke(&Base::plus, rw, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 10}}
++    std::invoke_r<double>(&Base::plus, rw, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 10}}
++
++    std::invoke_r<void *>(&Base::plus, rw, 4, 1);
++    // expected-error@-1{{can't invoke pointer-to-member function: return type 'int' isn't convertible to 'void *'}}
++  }
++  { // Concerning bullet 3
++    Base b;
++    Incompatible p;
++
++    std::invoke(&Base::plus, &p, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
++    std::invoke_r<double>(&Base::plus, &p, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
++
++    std::invoke(&Base::plus, &b, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
++    std::invoke_r<double>(&Base::plus, &b, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
++
++    std::invoke(&Base::plus, &b, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 10}}
++    std::invoke_r<double>(&Base::plus, &b, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 10}}
++
++    std::invoke_r<void *>(&Base::plus, &b, 4, 1);
++    // expected-error@-1{{can't invoke pointer-to-member function: return type 'int' isn't convertible to 'void *'}}
++  }
++  { // Concerning bullet 4
++    std::invoke(&Base::data);
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
++    std::invoke_r<double>(&Base::data);
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke_r' must have exactly 2 arguments for a pointer-to-data member, got 1}}
++
++    std::invoke(&Base::data, Incompatible{});
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
++    std::invoke_r<double>(&Base::data, Incompatible{});
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
++
++    std::invoke(&Base::data, Base{}, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
++    std::invoke_r<double>(&Base::data, Base{}, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke_r' must have exactly 2 arguments for a pointer-to-data member, got 1}}
++
++    std::invoke_r<void *>(&Base::data, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: return type 'int' isn't convertible to 'void *'}}
++  }
++  { // Concerning bullet 5
++    Base b;
++    std::reference_wrapper<Base> rw(b);
++
++    Incompatible p;
++    std::reference_wrapper<Incompatible> pw(p);
++
++    std::invoke(&Base::data, pw);
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
++    std::invoke_r<double>(&Base::data, pw);
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
++
++    std::invoke(&Base::data, rw, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
++    std::invoke_r<double>(&Base::data, rw, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke_r' must have exactly 2 arguments for a pointer-to-data member, got 1}}
++
++    std::invoke_r<void *>(&Base::data, rw);
++    // expected-error@-1{{can't invoke pointer-to-data member: return type 'int' isn't convertible to 'void *'}}
++  }
++  { // Concerning bullet 6
++    Base b;
++    Incompatible p;
++
++    std::invoke(&Base::data, &p);
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
++    std::invoke_r<double>(&Base::data, &p);
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
++
++    std::invoke(&Base::data, &b, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
++    std::invoke_r<double>(&Base::data, &b, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke_r' must have exactly 2 arguments for a pointer-to-data member, got 1}}
++
++    std::invoke_r<void *>(&Base::data, &b);
++    // expected-error@-1{{can't invoke pointer-to-data member: return type 'int' isn't convertible to 'void *'}}
++  }
++  { // Concerning bullet 7
++    std::invoke(square);
++    // expected-error@-1{{can't invoke function: expected 1 argument, got 0}}
++    std::invoke_r<double>(square);
++    // expected-error@-1{{can't invoke function: expected 1 argument, got 0}}
++
++    std::invoke(square, 1, 2);
++    // expected-error@-1{{can't invoke function: expected 1 argument, got 2}}
++    std::invoke_r<double>(square, 1, 2);
++    // expected-error@-1{{can't invoke function: expected 1 argument, got 2}}
++
++    std::invoke(&product, 1);
++    // expected-error@-1{{can't invoke function: expected 2 arguments, got 1}}
++    std::invoke_r<double>(&product, 1);
++    // expected-error@-1{{can't invoke function: expected 2 arguments, got 1}}
++
++    std::invoke(deleted_function);
++    // expected-error@-1{{attempt to use a deleted function}}
++    std::invoke_r<double>(deleted_function);
++    // expected-error@-1{{attempt to use a deleted function}}
++
++    std::invoke(callable{1}, 1, 2);
++    // expected-error@-1{{can't invoke 'callable' function object: no suitable overload found}}
++    std::invoke_r<double>(callable{1}, 1, 2);
++    // expected-error@-1{{can't invoke 'callable' function object: no suitable overload found}}
++
++    std::invoke_r<callable>(callable{1});
++    // expected-error@-1{{can't invoke 'callable' function object: return type 'int' isn't convertible to 'callable'}}
++
++    std::invoke(Ambiguous{}, 0.0);
++    // expected-error@-1{{can't invoke 'Ambiguous' function object: 2 suitable overloads found, which makes choosing ambiguous}}
++    std::invoke_r<double>(Ambiguous{}, 0.0);
++    // expected-error@-1{{can't invoke 'Ambiguous' function object: 2 suitable overloads found, which makes choosing ambiguous}}
++
++    std::invoke(Deleted{});
++    // expected-error@-1{{can't invoke 'Deleted' function object: chosen overload candidate is deleted}}
++    std::invoke_r<double>(Deleted{});
++    // expected-error@-1{{can't invoke 'Deleted' function object: chosen overload candidate is deleted}}
++  }
++}
+-- 
+2.25.1
+

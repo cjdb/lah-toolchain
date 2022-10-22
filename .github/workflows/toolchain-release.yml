@@ -1,0 +1,121 @@
+name: toolchain-release
+on:
+  schedule:
+    - cron: '23 18 * * 6'
+  push:
+    paths:
+      - '.github/workflows/toolchain-release.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/toolchain-release.yml'
+
+jobs:
+  toolchain:
+    name: Build LLVM
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: /usr/bin/clang-16
+      CXX: /usr/bin/clang++-16
+      artifact-path: llvm-${{ matrix.target.triple }}.tar.xz
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        target:
+          - name: X86
+            triple: x86_64-unknown-linux-gnu
+          - name: ARM
+            triple: armv7a-unknown-linux-gnu
+    steps:
+      - name: Install tools
+        id: install_tools
+        run: |
+          sudo wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add -
+          sudo apt-add-repository 'deb http://apt.llvm.org/focal/ llvm-toolchain-focal main'
+          sudo apt-get update
+          sudo apt-get autoremove -y
+          sudo apt-get remove -y clang-* llvm-*
+          sudo apt-get install -y  \
+            bzip2                  \
+            clang                  \
+            clang-tidy             \
+            clang-tools            \
+            g++-10                 \
+            g++-10-multilib        \
+            gcc-10                 \
+            gcc-10-multilib        \
+            glibc-source           \
+            libc++-16-dev          \
+            libc++abi-16-dev       \
+            libedit-dev            \
+            libz3-dev              \
+            lld                    \
+            llvm                   \
+            llvm-16-tools          \
+            lua5.3                 \
+            ninja-build            \
+            python3                \
+            python3-pip            \
+            swig4.0
+          sudo python3 -m pip install pip --upgrade
+          sudo python3 -m pip install cmake
+
+      - name: Checkout lah-toolchain
+        uses: actions/checkout@v3
+        id: checkout
+        with:
+          repository: cjdb/lah-toolchain.git
+          ref: main
+          path: lah-toolchain
+
+      - name: Checkout llvm-project
+        uses: actions/checkout@v3
+        id: checkout-llvm
+        with:
+          repository: llvm/llvm-project.git
+          ref: main
+          path: llvm-project
+
+      - name: Apply patches
+        working-directory: llvm-project
+        run: |
+          for i in `ls ../lah-toolchain/patches`; do
+            echo "Applying $i"
+            patch -p1 --verbose < "../lah-toolchain/patches/$i"
+          done
+
+      - name: Configure llvm-project
+        id: configure
+        run:
+          cmake
+            -G Ninja
+            -S llvm-project/llvm
+            -B build
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_CROSSCOMPILING=Yes
+            -DCMAKE_INSTALL_PREFIX=/tmp/llvm
+            -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.target.triple }}
+            -DLLVM_ENABLE_LLD=Yes
+            -DLLVM_ENABLE_LIBCXX=Yes
+            -DLLVM_ENABLE_MODULES=Yes
+            -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;polly'
+            -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind'
+            -DLLVM_ENABLE_ZLIB=Yes
+            -DLLVM_TARGETS_TO_BUILD=${{ matrix.target.name }}
+
+      - name: Build and install llvm-project
+        id: build
+        run: |
+          ninja -C build install
+          ninja -C build install-LLVMFileCheck
+
+      - name: Bundle llvm-project
+        id: bundle
+        working-directory: /tmp
+        run: tar -cf ${{ env.artifact-path }} llvm -I "xz -9 -T0"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.artifact-path }}
+          path: /tmp/${{ env.artifact-path }}
