@@ -3,11 +3,7 @@ on:
   schedule:
     - cron: '23 18 * * 6'
   push:
-    paths:
-      - '.github/workflows/toolchain-release.yml'
   pull_request:
-    paths:
-      - '.github/workflows/toolchain-release.yml'
 
 jobs:
   toolchain:
