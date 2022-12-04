@@ -20,8 +20,13 @@ jobs:
         target:
           - name: X86
             triple: x86_64-unknown-linux-gnu
+            gcc-triple:
           - name: ARM
-            triple: armv7a-unknown-linux-gnu
+            triple: armv7a-unknown-linux-gnueabi
+            gcc-triple: -arm-linux-gnueabi
+          - name: AArch64
+            triple: aarch64-unknown-linux-gnu
+            gcc-triple: -aarch64-linux-gnu
     steps:
       - name: Install tools
         id: install_tools
@@ -31,27 +36,26 @@ jobs:
           sudo apt-get update
           sudo apt-get autoremove -y
           sudo apt-get remove -y clang-* llvm-*
-          sudo apt-get install -y  \
-            bzip2                  \
-            clang                  \
-            clang-tidy             \
-            clang-tools            \
-            g++-10                 \
-            g++-10-multilib        \
-            gcc-10                 \
-            gcc-10-multilib        \
-            glibc-source           \
-            libc++-16-dev          \
-            libc++abi-16-dev       \
-            libedit-dev            \
-            libz3-dev              \
-            lld                    \
-            llvm                   \
-            llvm-16-tools          \
-            lua5.3                 \
-            ninja-build            \
-            python3                \
-            python3-pip            \
+          sudo apt-get install -y                   \
+            binutils${{ matrix.target.gcc-triple }} \
+            bzip2                                   \
+            clang                                   \
+            clang-tidy                              \
+            clang-tools                             \
+            gcc-10${{ matrix.target.gcc-triple }}   \
+            g++-10${{ matrix.target.gcc-triple }}   \
+            glibc-source                            \
+            libc++-16-dev                           \
+            libc++abi-16-dev                        \
+            libedit-dev                             \
+            libz3-dev                               \
+            lld                                     \
+            llvm                                    \
+            llvm-16-tools                           \
+            lua5.3                                  \
+            ninja-build                             \
+            python3                                 \
+            python3-pip                             \
             swig4.0
           sudo python3 -m pip install pip --upgrade
           sudo python3 -m pip install cmake
