@@ -32,7 +32,7 @@ jobs:
         id: install_tools
         run: |
           sudo wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add -
-          sudo apt-add-repository 'deb http://apt.llvm.org/focal/ llvm-toolchain-focal main'
+          sudo apt-add-repository 'deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy main'
           sudo apt-get update
           sudo apt-get autoremove -y
           sudo apt-get remove -y clang-* llvm-*
@@ -97,7 +97,7 @@ jobs:
             -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.target.triple }}
             -DLLVM_ENABLE_LLD=Yes
             -DLLVM_ENABLE_LIBCXX=Yes
-            -DLLVM_ENABLE_MODULES=Yes
+            -DLLVM_ENABLE_MODULES=No
             -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;polly'
             -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind'
             -DLLVM_ENABLE_ZLIB=Yes
