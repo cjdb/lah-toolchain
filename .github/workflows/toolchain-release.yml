@@ -10,8 +10,8 @@ jobs:
     name: Build LLVM
     runs-on: ${{ matrix.os }}
     env:
-      CC: /usr/bin/clang-16
-      CXX: /usr/bin/clang++-16
+      CC: /usr/bin/clang-17
+      CXX: /usr/bin/clang++-17
       artifact-path: llvm-${{ matrix.target.triple }}.tar.xz
     strategy:
       fail-fast: false
@@ -45,13 +45,13 @@ jobs:
             gcc-10${{ matrix.target.gcc-triple }}   \
             g++-10${{ matrix.target.gcc-triple }}   \
             glibc-source                            \
-            libc++-16-dev                           \
-            libc++abi-16-dev                        \
+            libc++-17-dev                           \
+            libc++abi-17-dev                        \
             libedit-dev                             \
             libz3-dev                               \
             lld                                     \
             llvm                                    \
-            llvm-16-tools                           \
+            llvm-17-tools                           \
             lua5.3                                  \
             ninja-build                             \
             python3                                 \
