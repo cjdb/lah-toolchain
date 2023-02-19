@@ -1,4 +1,4 @@
-From 152c8f7e117eb4a5d5e4226b08a917f67b6660cc Mon Sep 17 00:00:00 2001
+From efd674c6214d08e20b8d71ec6ddc6655b85d155c Mon Sep 17 00:00:00 2001
 From: Christopher Di Bella <cjdb.ns@gmail.com>
 Date: Sun, 23 Oct 2022 00:31:28 -0700
 Subject: [PATCH 2/3] adds builtin `std::invoke` and `std::invoke_r`
@@ -28,6 +28,7 @@ using `std::invoke`.
 
 Differential Revision: https://reviews.llvm.org/D130867
 ---
+ clang/include/clang/Basic/BuiltinHeaders.def  |   1 +
  clang/include/clang/Basic/Builtins.def        |   2 +
  .../clang/Basic/DiagnosticSemaKinds.td        |  27 +
  clang/include/clang/Sema/Sema.h               |  77 +--
@@ -39,27 +40,39 @@ Differential Revision: https://reviews.llvm.org/D130867
  clang/lib/Sema/SemaExprCXX.cpp                | 204 ++++++-
  clang/lib/Sema/SemaOverload.cpp               | 123 +++--
  clang/test/SemaCXX/builtin-std-invoke.cpp     | 496 ++++++++++++++++++
- 11 files changed, 918 insertions(+), 143 deletions(-)
+ 12 files changed, 919 insertions(+), 143 deletions(-)
  create mode 100644 clang/test/SemaCXX/builtin-std-invoke.cpp
 
+diff --git a/clang/include/clang/Basic/BuiltinHeaders.def b/clang/include/clang/Basic/BuiltinHeaders.def
+index 8e4a2f9bee9a..4ce0a0c660cf 100644
+--- a/clang/include/clang/Basic/BuiltinHeaders.def
++++ b/clang/include/clang/Basic/BuiltinHeaders.def
+@@ -16,6 +16,7 @@ HEADER(BLOCKS_H, "Blocks.h")
+ HEADER(COMPLEX_H, "complex.h")
+ HEADER(CTYPE_H, "ctype.h")
+ HEADER(EMMINTRIN_H, "emmintrin.h")
++HEADER(FUNCTIONAL, "functional")
+ HEADER(FOUNDATION_NSOBJCRUNTIME_H, "Foundation/NSObjCRuntime.h")
+ HEADER(IMMINTRIN_H, "immintrin.h")
+ HEADER(INTRIN_H, "intrin.h")
 diff --git a/clang/include/clang/Basic/Builtins.def b/clang/include/clang/Basic/Builtins.def
-index 5008a4e53a60..bb21c5e3e7a6 100644
+index 41288410786b..d22319728943 100644
 --- a/clang/include/clang/Basic/Builtins.def
 +++ b/clang/include/clang/Basic/Builtins.def
-@@ -1565,6 +1565,8 @@ LIBBUILTIN(addressof, "v*v&", "zfncThE", "memory", CXX_LANG)
- LANGBUILTIN(__addressof, "v*v&", "zfncTE", CXX_LANG)
- LIBBUILTIN(as_const, "v&v&", "zfncThE", "utility", CXX_LANG)
- LIBBUILTIN(forward, "v&v&", "zfncThE", "utility", CXX_LANG)
-+LIBBUILTIN(invoke, "v.", "zfTh", "functional", CXX_LANG)
-+LIBBUILTIN(invoke_r, "v.", "zfTh", "functional", CXX_LANG)
- LIBBUILTIN(move, "v&v&", "zfncThE", "utility", CXX_LANG)
- LIBBUILTIN(move_if_noexcept, "v&v&", "zfncThE", "utility", CXX_LANG)
+@@ -1572,6 +1572,8 @@ LIBBUILTIN(forward, "v&v&", "zfncThE", UTILITY, CXX_LANG)
+ LIBBUILTIN(forward_like, "v&v&", "zfncThE", UTILITY, CXX_LANG)
+ LIBBUILTIN(move, "v&v&", "zfncThE", UTILITY, CXX_LANG)
+ LIBBUILTIN(move_if_noexcept, "v&v&", "zfncThE", UTILITY, CXX_LANG)
++LIBBUILTIN(invoke, "v.", "zfTh", FUNCTIONAL, CXX_LANG)
++LIBBUILTIN(invoke_r, "v.", "zfTh", FUNCTIONAL, CXX_LANG)
  
+ // Annotation function
+ BUILTIN(__builtin_annotation, "v.", "tn")
 diff --git a/clang/include/clang/Basic/DiagnosticSemaKinds.td b/clang/include/clang/Basic/DiagnosticSemaKinds.td
-index 33a87af7d89d..e64385712a86 100644
+index 050b5378bc3d..81ff8fd48bda 100644
 --- a/clang/include/clang/Basic/DiagnosticSemaKinds.td
 +++ b/clang/include/clang/Basic/DiagnosticSemaKinds.td
-@@ -8448,6 +8448,33 @@ def err_typecheck_call_too_many_args_at_most_suggest : Error<
+@@ -8457,6 +8457,33 @@ def err_typecheck_call_too_many_args_at_most_suggest : Error<
    "%select{function|block|method|kernel function}0 call, "
    "expected at most %1, have %2; did you mean %3?">;
  
@@ -94,10 +107,10 @@ index 33a87af7d89d..e64385712a86 100644
    "incompatible pointer types passing retainable parameter of type %0"
    "to a CF function expecting %1 type">;
 diff --git a/clang/include/clang/Sema/Sema.h b/clang/include/clang/Sema/Sema.h
-index 67ba41ffa846..6c4080e945ea 100644
+index 37754837d752..eb1ccdbd0ec1 100644
 --- a/clang/include/clang/Sema/Sema.h
 +++ b/clang/include/clang/Sema/Sema.h
-@@ -4157,20 +4157,20 @@ public:
+@@ -4201,20 +4201,20 @@ public:
  
    ExprResult CreateOverloadedUnaryOp(SourceLocation OpLoc,
                                       UnaryOperatorKind Opc,
@@ -126,7 +139,7 @@ index 67ba41ffa846..6c4080e945ea 100644
    ExprResult BuildSynthesizedThreeWayComparison(SourceLocation OpLoc,
                                                  const UnresolvedSetImpl &Fns,
                                                  Expr *LHS, Expr *RHS,
-@@ -4180,17 +4180,16 @@ public:
+@@ -4224,17 +4224,16 @@ public:
                                                  SourceLocation RLoc, Expr *Base,
                                                  MultiExprArg Args);
  
@@ -154,7 +167,7 @@ index 67ba41ffa846..6c4080e945ea 100644
  
    ExprResult BuildOverloadedArrowExpr(Scope *S, Expr *Base,
                                        SourceLocation OpLoc,
-@@ -5331,7 +5330,8 @@ public:
+@@ -5378,7 +5377,8 @@ public:
                           bool ObjCPropertyAccess = false,
                           bool AvoidPartialAvailabilityChecks = false,
                           ObjCInterfaceDecl *ClassReciever = nullptr,
@@ -164,7 +177,7 @@ index 67ba41ffa846..6c4080e945ea 100644
    void NoteDeletedFunction(FunctionDecl *FD);
    void NoteDeletedInheritingConstructor(CXXConstructorDecl *CD);
    bool DiagnosePropertyAccessorMismatch(ObjCPropertyDecl *PD,
-@@ -5642,11 +5642,11 @@ public:
+@@ -5689,11 +5689,11 @@ public:
  
    // Binary/Unary Operators.  'Tok' is the token for the operator.
    ExprResult CreateBuiltinUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
@@ -180,7 +193,7 @@ index 67ba41ffa846..6c4080e945ea 100644
  
    bool isQualifiedMemberAccess(Expr *E);
    QualType CheckAddressOfOperand(ExprResult &Operand, SourceLocation OpLoc);
-@@ -5791,16 +5791,18 @@ public:
+@@ -5838,16 +5838,18 @@ public:
                    const TemplateArgumentListInfo *TemplateArgs = nullptr);
  
    void ActOnDefaultCtorInitializers(Decl *CDtorDecl);
@@ -204,7 +217,7 @@ index 67ba41ffa846..6c4080e945ea 100644
    /// ActOnCallExpr - Handle a call to Fn with the specified array of arguments.
    /// This provides the location of the left/right parens and a list of comma
    /// locations.
-@@ -5811,7 +5813,8 @@ public:
+@@ -5858,7 +5860,8 @@ public:
                             MultiExprArg ArgExprs, SourceLocation RParenLoc,
                             Expr *ExecConfig = nullptr,
                             bool IsExecConfig = false,
@@ -214,7 +227,7 @@ index 67ba41ffa846..6c4080e945ea 100644
    Expr *BuildBuiltinCallExpr(SourceLocation Loc, Builtin::ID Id,
                               MultiExprArg CallArgs);
    enum class AtomicArgumentOrder { API, AST };
-@@ -5824,7 +5827,8 @@ public:
+@@ -5871,7 +5874,8 @@ public:
    BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl, SourceLocation LParenLoc,
                          ArrayRef<Expr *> Arg, SourceLocation RParenLoc,
                          Expr *Config = nullptr, bool IsExecConfig = false,
@@ -224,7 +237,7 @@ index 67ba41ffa846..6c4080e945ea 100644
  
    ExprResult ActOnCUDAExecConfigExpr(Scope *S, SourceLocation LLLLoc,
                                       MultiExprArg ExecConfig,
-@@ -5875,10 +5879,11 @@ private:
+@@ -5922,10 +5926,11 @@ private:
  public:
    ExprResult ActOnBinOp(Scope *S, SourceLocation TokLoc,
                          tok::TokenKind Kind, Expr *LHSExpr, Expr *RHSExpr);
@@ -239,7 +252,7 @@ index 67ba41ffa846..6c4080e945ea 100644
    void LookupBinOp(Scope *S, SourceLocation OpLoc, BinaryOperatorKind Opc,
                     UnresolvedSetImpl &Functions);
  
-@@ -12420,8 +12425,8 @@ public:
+@@ -12526,8 +12531,8 @@ public:
    QualType InvalidLogicalVectorOperands(SourceLocation Loc, ExprResult &LHS,
                                   ExprResult &RHS);
    QualType CheckPointerToMemberOperands( // C++ 5.5
@@ -251,25 +264,25 @@ index 67ba41ffa846..6c4080e945ea 100644
      ExprResult &LHS, ExprResult &RHS, SourceLocation Loc, bool IsCompAssign,
      bool IsDivide);
 diff --git a/clang/lib/AST/ExprConstant.cpp b/clang/lib/AST/ExprConstant.cpp
-index 120ceb9ad081..fb50e099a2f8 100644
+index 3e2164c4eebc..effa9c4c46e8 100644
 --- a/clang/lib/AST/ExprConstant.cpp
 +++ b/clang/lib/AST/ExprConstant.cpp
-@@ -8348,6 +8348,8 @@ bool LValueExprEvaluator::VisitCallExpr(const CallExpr *E) {
-     return false;
-   case Builtin::BIas_const:
-   case Builtin::BIforward:
-+  case Builtin::BIinvoke:
-+  case Builtin::BIinvoke_r:
+@@ -8342,6 +8342,8 @@ bool LValueExprEvaluator::VisitCallExpr(const CallExpr *E) {
+   case Builtin::BIforward_like:
    case Builtin::BImove:
    case Builtin::BImove_if_noexcept:
++  case Builtin::BIinvoke:
++  case Builtin::BIinvoke_r:
      if (cast<FunctionDecl>(E->getCalleeDecl())->isConstexpr())
+       return Visit(E->getArg(0));
+     break;
 diff --git a/clang/lib/CodeGen/CGBuiltin.cpp b/clang/lib/CodeGen/CGBuiltin.cpp
-index ce5bcc78e168..bc9da091252d 100644
+index 52ec6e092c44..dfefc17480df 100644
 --- a/clang/lib/CodeGen/CGBuiltin.cpp
 +++ b/clang/lib/CodeGen/CGBuiltin.cpp
-@@ -4671,6 +4671,8 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
-   case Builtin::BImove_if_noexcept:
+@@ -4694,6 +4694,8 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
    case Builtin::BIforward:
+   case Builtin::BIforward_like:
    case Builtin::BIas_const:
 +  case Builtin::BIinvoke:
 +  case Builtin::BIinvoke_r:
@@ -277,7 +290,7 @@ index ce5bcc78e168..bc9da091252d 100644
    case Builtin::BI__GetExceptionInfo: {
      if (llvm::GlobalVariable *GV =
 diff --git a/clang/lib/Sema/SemaChecking.cpp b/clang/lib/Sema/SemaChecking.cpp
-index 75296306c98e..b00eba655f22 100644
+index 54f7d041a857..71ac28f62775 100644
 --- a/clang/lib/Sema/SemaChecking.cpp
 +++ b/clang/lib/Sema/SemaChecking.cpp
 @@ -28,6 +28,7 @@
@@ -288,7 +301,7 @@ index 75296306c98e..b00eba655f22 100644
  #include "clang/AST/NonTrivialTypeVisitor.h"
  #include "clang/AST/OperationKinds.h"
  #include "clang/AST/RecordLayout.h"
-@@ -2464,6 +2465,11 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
+@@ -2498,6 +2499,11 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
      }
      break;
    }
@@ -301,10 +314,10 @@ index 75296306c98e..b00eba655f22 100644
    case Builtin::BIread_pipe:
    case Builtin::BIwrite_pipe:
 diff --git a/clang/lib/Sema/SemaDecl.cpp b/clang/lib/Sema/SemaDecl.cpp
-index 0d2cd02d1029..5378c26285e7 100644
+index ba5b2f67beca..002a18537c66 100644
 --- a/clang/lib/Sema/SemaDecl.cpp
 +++ b/clang/lib/Sema/SemaDecl.cpp
-@@ -9551,6 +9551,9 @@ static bool isStdBuiltin(ASTContext &Ctx, FunctionDecl *FD,
+@@ -9567,6 +9567,9 @@ static bool isStdBuiltin(ASTContext &Ctx, FunctionDecl *FD,
      const auto *FPT = FD->getType()->castAs<FunctionProtoType>();
      return FPT->getNumParams() == 1 && !FPT->isVariadic();
    }
@@ -315,10 +328,10 @@ index 0d2cd02d1029..5378c26285e7 100644
    default:
      return false;
 diff --git a/clang/lib/Sema/SemaExpr.cpp b/clang/lib/Sema/SemaExpr.cpp
-index 94f52004cf6c..581355f264cb 100644
+index ab34fd87b677..d8723df67591 100644
 --- a/clang/lib/Sema/SemaExpr.cpp
 +++ b/clang/lib/Sema/SemaExpr.cpp
-@@ -223,7 +223,8 @@ bool Sema::DiagnoseUseOfDecl(NamedDecl *D, ArrayRef<SourceLocation> Locs,
+@@ -224,7 +224,8 @@ bool Sema::DiagnoseUseOfDecl(NamedDecl *D, ArrayRef<SourceLocation> Locs,
                               bool ObjCPropertyAccess,
                               bool AvoidPartialAvailabilityChecks,
                               ObjCInterfaceDecl *ClassReceiver,
@@ -328,7 +341,7 @@ index 94f52004cf6c..581355f264cb 100644
    SourceLocation Loc = Locs.front();
    if (getLangOpts().CPlusPlus && isa<FunctionDecl>(D)) {
      // If there were any diagnostics suppressed by template argument deduction,
-@@ -264,13 +265,15 @@ bool Sema::DiagnoseUseOfDecl(NamedDecl *D, ArrayRef<SourceLocation> Locs,
+@@ -265,13 +266,15 @@ bool Sema::DiagnoseUseOfDecl(NamedDecl *D, ArrayRef<SourceLocation> Locs,
      // See if this is a deleted function.
      if (FD->isDeleted()) {
        auto *Ctor = dyn_cast<CXXConstructorDecl>(FD);
@@ -351,7 +364,7 @@ index 94f52004cf6c..581355f264cb 100644
        return true;
      }
  
-@@ -6010,13 +6013,12 @@ static TypoCorrection TryTypoCorrectionForCall(Sema &S, Expr *Fn,
+@@ -6250,13 +6253,12 @@ static TypoCorrection TryTypoCorrectionForCall(Sema &S, Expr *Fn,
  /// Fn is the function expression. For a C++ member function, this
  /// routine does not attempt to convert the object argument. Returns
  /// true if the call is ill-formed.
@@ -371,7 +384,7 @@ index 94f52004cf6c..581355f264cb 100644
    // Bail out early if calling a builtin with custom typechecking.
    if (FDecl)
      if (unsigned ID = FDecl->getBuiltinID())
-@@ -6038,7 +6040,17 @@ Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
+@@ -6278,7 +6280,17 @@ Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
    if (Args.size() < NumParams) {
      if (Args.size() < MinArgs) {
        TypoCorrection TC;
@@ -390,7 +403,7 @@ index 94f52004cf6c..581355f264cb 100644
          unsigned diag_id =
              MinArgs == NumParams && !Proto->isVariadic()
                  ? diag::err_typecheck_call_too_few_args_suggest
-@@ -6076,7 +6088,17 @@ Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
+@@ -6316,7 +6328,17 @@ Sema::ConvertArgumentsForCall(CallExpr *Call, Expr *Fn,
    if (Args.size() > NumParams) {
      if (!Proto->isVariadic()) {
        TypoCorrection TC;
@@ -409,7 +422,7 @@ index 94f52004cf6c..581355f264cb 100644
          unsigned diag_id =
              MinArgs == NumParams && !Proto->isVariadic()
                  ? diag::err_typecheck_call_too_many_args_suggest
-@@ -6645,7 +6667,7 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+@@ -6888,7 +6910,7 @@ ExprResult Sema::ActOnCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
  ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                                 MultiExprArg ArgExprs, SourceLocation RParenLoc,
                                 Expr *ExecConfig, bool IsExecConfig,
@@ -418,7 +431,7 @@ index 94f52004cf6c..581355f264cb 100644
    // Since this might be a postfix expression, get rid of ParenListExprs.
    ExprResult Result = MaybeConvertParenListExprToParenExpr(Scope, Fn);
    if (Result.isInvalid()) return ExprError();
-@@ -6696,7 +6718,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+@@ -6939,7 +6961,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
      // Determine whether this is a call to an object (C++ [over.call.object]).
      if (Fn->getType()->isRecordType())
        return BuildCallToObjectOfClassType(Scope, Fn, LParenLoc, ArgExprs,
@@ -427,7 +440,7 @@ index 94f52004cf6c..581355f264cb 100644
  
      if (Fn->getType() == Context.UnknownAnyTy) {
        ExprResult result = rebuildUnknownAnyFunction(*this, Fn);
-@@ -6707,7 +6729,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+@@ -6950,7 +6972,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
      if (Fn->getType() == Context.BoundMemberTy) {
        return BuildCallToMemberFunction(Scope, Fn, LParenLoc, ArgExprs,
                                         RParenLoc, ExecConfig, IsExecConfig,
@@ -436,7 +449,7 @@ index 94f52004cf6c..581355f264cb 100644
      }
    }
  
-@@ -6727,7 +6749,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+@@ -6970,7 +6992,7 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
              /*AllowTypoCorrection=*/true, find.IsAddressOfOperand);
        return BuildCallToMemberFunction(Scope, Fn, LParenLoc, ArgExprs,
                                         RParenLoc, ExecConfig, IsExecConfig,
@@ -445,7 +458,7 @@ index 94f52004cf6c..581355f264cb 100644
      }
    }
  
-@@ -6844,7 +6866,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
+@@ -7087,7 +7109,8 @@ ExprResult Sema::BuildCallExpr(Scope *Scope, Expr *Fn, SourceLocation LParenLoc,
                              CurFPFeatureOverrides());
    }
    return BuildResolvedCallExpr(Fn, NDecl, LParenLoc, ArgExprs, RParenLoc,
@@ -455,7 +468,7 @@ index 94f52004cf6c..581355f264cb 100644
  }
  
  /// BuildBuiltinCallExpr - Create a call to a builtin function specified by Id
-@@ -6919,7 +6942,8 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
+@@ -7162,7 +7185,8 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
                                         SourceLocation LParenLoc,
                                         ArrayRef<Expr *> Args,
                                         SourceLocation RParenLoc, Expr *Config,
@@ -465,7 +478,7 @@ index 94f52004cf6c..581355f264cb 100644
    FunctionDecl *FDecl = dyn_cast_or_null<FunctionDecl>(NDecl);
    unsigned BuiltinID = (FDecl ? FDecl->getBuiltinID() : 0);
  
-@@ -7095,7 +7119,7 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
+@@ -7338,7 +7362,7 @@ ExprResult Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
  
    if (Proto) {
      if (ConvertArgumentsForCall(TheCall, Fn, FDecl, Proto, Args, RParenLoc,
@@ -474,7 +487,7 @@ index 94f52004cf6c..581355f264cb 100644
        return ExprError();
    } else {
      assert(isa<FunctionNoProtoType>(FuncT) && "Unknown FunctionType!");
-@@ -14527,7 +14551,8 @@ static void RecordModifiableNonNullParam(Sema &S, const Expr *Exp) {
+@@ -14779,7 +14803,8 @@ static void RecordModifiableNonNullParam(Sema &S, const Expr *Exp) {
  /// CheckIndirectionOperand - Type check unary indirection (prefix '*').
  static QualType CheckIndirectionOperand(Sema &S, Expr *Op, ExprValueKind &VK,
                                          SourceLocation OpLoc,
@@ -484,7 +497,7 @@ index 94f52004cf6c..581355f264cb 100644
    if (Op->isTypeDependent())
      return S.Context.DependentTy;
  
-@@ -14555,12 +14580,13 @@ static QualType CheckIndirectionOperand(Sema &S, Expr *Op, ExprValueKind &VK,
+@@ -14807,12 +14832,13 @@ static QualType CheckIndirectionOperand(Sema &S, Expr *Op, ExprValueKind &VK,
      ExprResult PR = S.CheckPlaceholderExpr(Op);
      if (PR.isInvalid()) return QualType();
      if (PR.get() != Op)
@@ -501,7 +514,7 @@ index 94f52004cf6c..581355f264cb 100644
      return QualType();
    }
  
-@@ -14866,8 +14892,8 @@ static bool needsConversionOfHalfVec(bool OpRequiresConversion, ASTContext &Ctx,
+@@ -15118,8 +15144,8 @@ static bool needsConversionOfHalfVec(bool OpRequiresConversion, ASTContext &Ctx,
  /// operator @p Opc at location @c TokLoc. This routine only supports
  /// built-in operations; ActOnBinOp handles overloaded operators.
  ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
@@ -512,7 +525,7 @@ index 94f52004cf6c..581355f264cb 100644
    if (getLangOpts().CPlusPlus11 && isa<InitListExpr>(RHSExpr)) {
      // The syntax only allows initializer lists on the RHS of assignment,
      // so we don't need to worry about accepting invalid code for
-@@ -14967,7 +14993,7 @@ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
+@@ -15219,7 +15245,7 @@ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
    case BO_PtrMemD:
    case BO_PtrMemI:
      ResultTy = CheckPointerToMemberOperands(LHS, RHS, VK, OpLoc,
@@ -521,7 +534,7 @@ index 94f52004cf6c..581355f264cb 100644
      break;
    case BO_Mul:
    case BO_Div:
-@@ -15380,8 +15406,8 @@ void Sema::LookupBinOp(Scope *S, SourceLocation OpLoc, BinaryOperatorKind Opc,
+@@ -15613,8 +15639,8 @@ void Sema::LookupBinOp(Scope *S, SourceLocation OpLoc, BinaryOperatorKind Opc,
  
  /// Build an overloaded binary operator expression in the given scope.
  static ExprResult BuildOverloadedBinOp(Sema &S, Scope *Sc, SourceLocation OpLoc,
@@ -532,7 +545,7 @@ index 94f52004cf6c..581355f264cb 100644
    switch (Opc) {
    case BO_Assign:
    case BO_DivAssign:
-@@ -15403,12 +15429,13 @@ static ExprResult BuildOverloadedBinOp(Sema &S, Scope *Sc, SourceLocation OpLoc,
+@@ -15636,12 +15662,13 @@ static ExprResult BuildOverloadedBinOp(Sema &S, Scope *Sc, SourceLocation OpLoc,
  
    // Build the (potentially-overloaded, potentially-dependent)
    // binary operation.
@@ -549,7 +562,7 @@ index 94f52004cf6c..581355f264cb 100644
    ExprResult LHS, RHS;
    std::tie(LHS, RHS) = CorrectDelayedTyposInBinOp(*this, Opc, LHSExpr, RHSExpr);
    if (!LHS.isUsable() || !RHS.isUsable())
-@@ -15482,7 +15509,7 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
+@@ -15715,7 +15742,7 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
             LHSExpr->getType()->isOverloadableType()))
          return BuildOverloadedBinOp(*this, S, OpLoc, Opc, LHSExpr, RHSExpr);
  
@@ -558,7 +571,7 @@ index 94f52004cf6c..581355f264cb 100644
      }
  
      // Don't resolve overloads if the other type is overloadable.
-@@ -15505,7 +15532,8 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
+@@ -15738,7 +15765,8 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
      // overloadable type.
      if (LHSExpr->getType()->isOverloadableType() ||
          RHSExpr->getType()->isOverloadableType())
@@ -568,7 +581,7 @@ index 94f52004cf6c..581355f264cb 100644
    }
  
    if (getLangOpts().RecoveryAST &&
-@@ -15550,7 +15578,7 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
+@@ -15783,7 +15811,7 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
    }
  
    // Build a built-in binary operation.
@@ -577,7 +590,7 @@ index 94f52004cf6c..581355f264cb 100644
  }
  
  static bool isOverflowingIntegerType(ASTContext &Ctx, QualType T) {
-@@ -15565,7 +15593,8 @@ static bool isOverflowingIntegerType(ASTContext &Ctx, QualType T) {
+@@ -15798,7 +15826,8 @@ static bool isOverflowingIntegerType(ASTContext &Ctx, QualType T) {
  
  ExprResult Sema::CreateBuiltinUnaryOp(SourceLocation OpLoc,
                                        UnaryOperatorKind Opc, Expr *InputExpr,
@@ -587,7 +600,7 @@ index 94f52004cf6c..581355f264cb 100644
    ExprResult Input = InputExpr;
    ExprValueKind VK = VK_PRValue;
    ExprObjectKind OK = OK_Ordinary;
-@@ -15616,7 +15645,7 @@ ExprResult Sema::CreateBuiltinUnaryOp(SourceLocation OpLoc,
+@@ -15849,7 +15878,7 @@ ExprResult Sema::CreateBuiltinUnaryOp(SourceLocation OpLoc,
      Input = DefaultFunctionArrayLvalueConversion(Input.get());
      if (Input.isInvalid()) return ExprError();
      resultType =
@@ -596,7 +609,7 @@ index 94f52004cf6c..581355f264cb 100644
      break;
    }
    case UO_Plus:
-@@ -15837,7 +15866,8 @@ bool Sema::isQualifiedMemberAccess(Expr *E) {
+@@ -16070,7 +16099,8 @@ bool Sema::isQualifiedMemberAccess(Expr *E) {
  
  ExprResult Sema::BuildUnaryOp(Scope *S, SourceLocation OpLoc,
                                UnaryOperatorKind Opc, Expr *Input,
@@ -606,7 +619,7 @@ index 94f52004cf6c..581355f264cb 100644
    // First things first: handle placeholders so that the
    // overloaded-operator check considers the right type.
    if (const BuiltinType *pty = Input->getType()->getAsPlaceholderType()) {
-@@ -15873,10 +15903,11 @@ ExprResult Sema::BuildUnaryOp(Scope *S, SourceLocation OpLoc,
+@@ -16106,10 +16136,11 @@ ExprResult Sema::BuildUnaryOp(Scope *S, SourceLocation OpLoc,
      if (S && OverOp != OO_None)
        LookupOverloadedOperatorName(OverOp, S, Functions);
  
@@ -621,7 +634,7 @@ index 94f52004cf6c..581355f264cb 100644
  
  // Unary Operators.  'Tok' is the token for the operator.
 diff --git a/clang/lib/Sema/SemaExprCXX.cpp b/clang/lib/Sema/SemaExprCXX.cpp
-index 9020e0421c02..90d69e0eb4de 100644
+index 8d1337697c7d..b9e96eff100c 100644
 --- a/clang/lib/Sema/SemaExprCXX.cpp
 +++ b/clang/lib/Sema/SemaExprCXX.cpp
 @@ -17,7 +17,9 @@
@@ -642,7 +655,7 @@ index 9020e0421c02..90d69e0eb4de 100644
  #include "clang/Basic/TargetInfo.h"
  #include "clang/Basic/TokenKinds.h"
  #include "clang/Basic/TypeTraits.h"
-@@ -5829,6 +5832,183 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
+@@ -5828,6 +5831,183 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
    llvm_unreachable("Unknown type trait or not implemented");
  }
  
@@ -826,7 +839,7 @@ index 9020e0421c02..90d69e0eb4de 100644
  ExprResult Sema::ActOnArrayTypeTrait(ArrayTypeTrait ATT,
                                       SourceLocation KWLoc,
                                       ParsedType Ty,
-@@ -5960,8 +6140,8 @@ ExprResult Sema::BuildExpressionTrait(ExpressionTrait ET,
+@@ -5959,8 +6139,8 @@ ExprResult Sema::BuildExpressionTrait(ExpressionTrait ET,
  
  QualType Sema::CheckPointerToMemberOperands(ExprResult &LHS, ExprResult &RHS,
                                              ExprValueKind &VK,
@@ -837,7 +850,7 @@ index 9020e0421c02..90d69e0eb4de 100644
    assert(!LHS.get()->hasPlaceholderType() && !RHS.get()->hasPlaceholderType() &&
           "placeholders should have been weeded out by now");
  
-@@ -6079,16 +6259,28 @@ QualType Sema::CheckPointerToMemberOperands(ExprResult &LHS, ExprResult &RHS,
+@@ -6078,16 +6258,28 @@ QualType Sema::CheckPointerToMemberOperands(ExprResult &LHS, ExprResult &RHS,
            Diag(Loc, getLangOpts().CPlusPlus20
                          ? diag::warn_cxx17_compat_pointer_to_const_ref_member_on_rvalue
                          : diag::ext_pointer_to_const_ref_member_on_rvalue);
@@ -871,10 +884,10 @@ index 9020e0421c02..90d69e0eb4de 100644
      }
    }
 diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
-index 7f3d400fc67e..04bf59485c80 100644
+index d68337a26d97..ac4c79756a01 100644
 --- a/clang/lib/Sema/SemaOverload.cpp
 +++ b/clang/lib/Sema/SemaOverload.cpp
-@@ -54,11 +54,13 @@ static bool functionHasPassObjectSizeParams(const FunctionDecl *FD) {
+@@ -53,11 +53,13 @@ static bool functionHasPassObjectSizeParams(const FunctionDecl *FD) {
  }
  
  /// A convenience routine for creating a decayed reference to a function.
@@ -893,7 +906,7 @@ index 7f3d400fc67e..04bf59485c80 100644
      return ExprError();
    // If FoundDecl is different from Fn (such as if one is a template
    // and the other a specialization), make sure DiagnoseUseOfDecl is
-@@ -13535,10 +13537,11 @@ ExprResult Sema::CreateUnresolvedLookupExpr(CXXRecordDecl *NamingClass,
+@@ -13552,10 +13554,11 @@ ExprResult Sema::CreateUnresolvedLookupExpr(CXXRecordDecl *NamingClass,
  /// by CreateOverloadedUnaryOp().
  ///
  /// \param Input The input argument.
@@ -909,7 +922,7 @@ index 7f3d400fc67e..04bf59485c80 100644
    OverloadedOperatorKind Op = UnaryOperator::getOverloadedOperator(Opc);
    assert(Op != OO_None && "Invalid opcode for overloaded unary operator");
    DeclarationName OpName = Context.DeclarationNames.getCXXOperatorName(Op);
-@@ -13708,7 +13711,7 @@ Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
+@@ -13725,7 +13728,7 @@ Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
    // Either we found no viable overloaded operator or we matched a
    // built-in operator. In either case, fall through to trying to
    // build a built-in operation.
@@ -918,7 +931,7 @@ index 7f3d400fc67e..04bf59485c80 100644
  }
  
  /// Perform lookup for an overloaded binary operator.
-@@ -13798,12 +13801,11 @@ void Sema::LookupOverloadedBinOp(OverloadCandidateSet &CandidateSet,
+@@ -13815,12 +13818,11 @@ void Sema::LookupOverloadedBinOp(OverloadCandidateSet &CandidateSet,
  ///        the function in question. Such a function is never a candidate in
  ///        our overload resolution. This also enables synthesizing a three-way
  ///        comparison from < and == as described in C++20 [class.spaceship]p1.
@@ -936,7 +949,7 @@ index 7f3d400fc67e..04bf59485c80 100644
    Expr *Args[2] = { LHS, RHS };
    LHS=RHS=nullptr; // Please use only Args instead of LHS/RHS couple
  
-@@ -13859,12 +13861,12 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+@@ -13876,12 +13878,12 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
    // problems. So we do it this way, which pretty much follows what GCC does.
    // Note that we go the traditional code path for compound assignment forms.
    if (Opc == BO_Assign && !Args[0]->getType()->isOverloadableType())
@@ -951,7 +964,7 @@ index 7f3d400fc67e..04bf59485c80 100644
  
    // Build the overload set.
    OverloadCandidateSet CandidateSet(OpLoc, OverloadCandidateSet::CSK_Operator,
-@@ -14166,7 +14168,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+@@ -14183,7 +14185,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
  
          // No viable function; try to create a built-in operation, which will
          // produce an error. Then, show the non-viable candidates.
@@ -960,7 +973,7 @@ index 7f3d400fc67e..04bf59485c80 100644
        }
        assert(Result.isInvalid() &&
               "C++ binary operator overloading is missing candidates!");
-@@ -14217,7 +14219,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+@@ -14234,7 +14236,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
    }
  
    // We matched a built-in operator; build it.
@@ -969,7 +982,7 @@ index 7f3d400fc67e..04bf59485c80 100644
  }
  
  ExprResult Sema::BuildSynthesizedThreeWayComparison(
-@@ -14544,12 +14546,10 @@ ExprResult Sema::CreateOverloadedArraySubscriptExpr(SourceLocation LLoc,
+@@ -14561,12 +14563,10 @@ ExprResult Sema::CreateOverloadedArraySubscriptExpr(SourceLocation LLoc,
  /// parameter). The caller needs to validate that the member
  /// expression refers to a non-static member function or an overloaded
  /// member function.
@@ -986,7 +999,7 @@ index 7f3d400fc67e..04bf59485c80 100644
    assert(MemExprE->getType() == Context.BoundMemberTy ||
           MemExprE->getType() == Context.OverloadTy);
  
-@@ -14583,10 +14583,16 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+@@ -14600,10 +14600,16 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
      difference.removeAddressSpace();
      if (difference) {
        std::string qualsString = difference.getAsString();
@@ -1007,7 +1020,7 @@ index 7f3d400fc67e..04bf59485c80 100644
      }
  
      CXXMemberCallExpr *call = CXXMemberCallExpr::Create(
-@@ -14597,7 +14603,8 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+@@ -14614,7 +14620,8 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
                              call, nullptr))
        return ExprError();
  
@@ -1017,7 +1030,7 @@ index 7f3d400fc67e..04bf59485c80 100644
        return ExprError();
  
      if (CheckOtherCall(call, proto))
-@@ -14840,11 +14847,11 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+@@ -14857,11 +14864,11 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
  /// type (C++ [over.call.object]), which can end up invoking an
  /// overloaded function call operator (@c operator()) or performing a
  /// user-defined conversion on the object argument.
@@ -1034,7 +1047,7 @@ index 7f3d400fc67e..04bf59485c80 100644
    if (checkPlaceholderForOverload(*this, Obj))
      return ExprError();
    ExprResult Object = Obj;
-@@ -14933,6 +14940,8 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+@@ -14950,6 +14957,8 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
  
    // Perform overload resolution.
    OverloadCandidateSet::iterator Best;
@@ -1043,7 +1056,7 @@ index 7f3d400fc67e..04bf59485c80 100644
    switch (CandidateSet.BestViableFunction(*this, Object.get()->getBeginLoc(),
                                            Best)) {
    case OR_Success:
-@@ -14943,32 +14952,33 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+@@ -14960,32 +14969,33 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
    case OR_No_Viable_Function: {
      PartialDiagnostic PD =
          CandidateSet.empty()
@@ -1094,7 +1107,7 @@ index 7f3d400fc67e..04bf59485c80 100644
      break;
    }
  
-@@ -15025,10 +15035,9 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+@@ -15042,10 +15052,9 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
    DeclarationNameInfo OpLocInfo(
                 Context.DeclarationNames.getCXXOperatorName(OO_Call), LParenLoc);
    OpLocInfo.setCXXOperatorNameRange(SourceRange(LParenLoc, RParenLoc));
@@ -1611,5 +1624,5 @@ index 000000000000..cafda54f04b8
 +  }
 +}
 -- 
-2.39.0.314.g84b9a713c41-goog
+2.39.2.637.g21b0678d19-goog
 

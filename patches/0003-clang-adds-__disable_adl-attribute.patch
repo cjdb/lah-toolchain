@@ -1,4 +1,4 @@
-From e2bc953320013f3efd7457c45ce5d3f059950ac2 Mon Sep 17 00:00:00 2001
+From 0de7e773cc50ff882b43ed6c901898e0d51a336b Mon Sep 17 00:00:00 2001
 From: Christopher Di Bella <cjdb.ns@gmail.com>
 Date: Sun, 23 Oct 2022 00:37:32 -0700
 Subject: [PATCH 3/3] adds `__disable_adl` attribute
@@ -28,19 +28,19 @@ Differential Revision: https://reviews.llvm.org/D129951
  clang/include/clang/Basic/AttrDocs.td         |  35 ++--
  .../clang/Basic/DiagnosticSemaKinds.td        |   3 +
  clang/include/clang/Basic/TokenKinds.def      |   1 +
- clang/lib/Parse/ParseDecl.cpp                 |   8 +
- clang/lib/Sema/SemaDeclAttr.cpp               |  12 ++
+ clang/lib/Parse/ParseDecl.cpp                 |   9 +
+ clang/lib/Sema/SemaDeclAttr.cpp               |  14 ++
  clang/lib/Sema/SemaLookup.cpp                 |   3 +
- clang/lib/Sema/SemaOverload.cpp               |  27 ++-
+ clang/lib/Sema/SemaOverload.cpp               |  31 +--
  clang/test/SemaCXX/disable-adl.cpp            | 179 ++++++++++++++++++
- 10 files changed, 256 insertions(+), 22 deletions(-)
+ 10 files changed, 257 insertions(+), 28 deletions(-)
  create mode 100644 clang/test/SemaCXX/disable-adl.cpp
 
 diff --git a/clang/include/clang/AST/ExprCXX.h b/clang/include/clang/AST/ExprCXX.h
-index 715dba013e1b..fad3c65e5b5d 100644
+index 032fd199b030..3a59b93e6d92 100644
 --- a/clang/include/clang/AST/ExprCXX.h
 +++ b/clang/include/clang/AST/ExprCXX.h
-@@ -3163,6 +3163,9 @@ public:
+@@ -3214,6 +3214,9 @@ public:
    /// argument-dependent lookup.
    bool requiresADL() const { return UnresolvedLookupExprBits.RequiresADL; }
  
@@ -51,10 +51,10 @@ index 715dba013e1b..fad3c65e5b5d 100644
    bool isOverloaded() const { return UnresolvedLookupExprBits.Overloaded; }
  
 diff --git a/clang/include/clang/Basic/Attr.td b/clang/include/clang/Basic/Attr.td
-index aef3356ed405..fb9d41201ff9 100644
+index fc2c7f7e37f4..7e93af9c7736 100644
 --- a/clang/include/clang/Basic/Attr.td
 +++ b/clang/include/clang/Basic/Attr.td
-@@ -4101,3 +4101,10 @@ def ReadOnlyPlacement : InheritableAttr {
+@@ -4133,3 +4133,10 @@ def ReadOnlyPlacement : InheritableAttr {
    let Subjects = SubjectList<[Record]>;
    let Documentation = [ReadOnlyPlacementDocs];
  }
@@ -66,7 +66,7 @@ index aef3356ed405..fb9d41201ff9 100644
 +  let LangOpts = [CPlusPlus];
 +}
 diff --git a/clang/include/clang/Basic/AttrDocs.td b/clang/include/clang/Basic/AttrDocs.td
-index 77f72d2b2bd4..ee31434be4ff 100644
+index eebbf6863dd4..8a89d0cbf95a 100644
 --- a/clang/include/clang/Basic/AttrDocs.td
 +++ b/clang/include/clang/Basic/AttrDocs.td
 @@ -539,16 +539,16 @@ def NoMergeDocs : Documentation {
@@ -99,7 +99,7 @@ index 77f72d2b2bd4..ee31434be4ff 100644
  ``driverkit``
    Apple's DriverKit userspace kernel extensions. The minimum deployment target
    is specified as part of the triple.
-@@ -3857,7 +3857,7 @@ Whether a particular pointer may be "null" is an important concern when working
+@@ -3883,7 +3883,7 @@ Whether a particular pointer may be "null" is an important concern when working
  with pointers in the C family of languages. The various nullability attributes
  indicate whether a particular pointer can be null or not, which makes APIs more
  expressive and can help static analysis tools identify bugs involving null
@@ -108,7 +108,7 @@ index 77f72d2b2bd4..ee31434be4ff 100644
  ``nonnull`` and ``returns_nonnull`` attributes indicate which function or
  method parameters and result types can never be null, while nullability type
  qualifiers indicate which pointer types can be null (``_Nullable``) or cannot
-@@ -4033,7 +4033,7 @@ memory is not available rather than returning a null pointer:
+@@ -4059,7 +4059,7 @@ memory is not available rather than returning a null pointer:
  The ``returns_nonnull`` attribute implies that returning a null pointer is
  undefined behavior, which the optimizer may take advantage of. The ``_Nonnull``
  type qualifier indicates that a pointer cannot be null in a more general manner
@@ -117,7 +117,7 @@ index 77f72d2b2bd4..ee31434be4ff 100644
  making it more widely applicable
  }];
  }
-@@ -5982,15 +5982,15 @@ def CFGuardDocs : Documentation {
+@@ -6008,15 +6008,15 @@ def CFGuardDocs : Documentation {
    let Content = [{
  Code can indicate CFG checks are not wanted with the ``__declspec(guard(nocf))``
  attribute. This directs the compiler to not insert any CFG checks for the entire
@@ -142,7 +142,7 @@ index 77f72d2b2bd4..ee31434be4ff 100644
  only call one function.
  
  `Control Flow Guard documentation <https://docs.microsoft.com/en-us/windows/win32/secbp/pe-metadata>`
-@@ -6821,3 +6821,6 @@ def ReadOnlyPlacementDocs : Documentation {
+@@ -6925,3 +6925,6 @@ def ReadOnlyPlacementDocs : Documentation {
       ``enforce_read_only_placement`` attribute.
    }];
  }
@@ -150,10 +150,10 @@ index 77f72d2b2bd4..ee31434be4ff 100644
 +  let Content = [{Please don't LGTM without this being fully documented.}];
 +}
 diff --git a/clang/include/clang/Basic/DiagnosticSemaKinds.td b/clang/include/clang/Basic/DiagnosticSemaKinds.td
-index e64385712a86..e4a92720e6b5 100644
+index 81ff8fd48bda..3f4a7bf0c2cc 100644
 --- a/clang/include/clang/Basic/DiagnosticSemaKinds.td
 +++ b/clang/include/clang/Basic/DiagnosticSemaKinds.td
-@@ -3154,6 +3154,9 @@ def err_attribute_invalid_size : Error<
+@@ -3163,6 +3163,9 @@ def err_attribute_invalid_size : Error<
    "vector size not an integral multiple of component size">;
  def err_attribute_zero_size : Error<"zero %0 size">;
  def err_attribute_size_too_large : Error<"%0 size too large">;
@@ -164,10 +164,10 @@ index e64385712a86..e4a92720e6b5 100644
    "cannot combine fixed-length and sizeless SVE vectors in expression, result is ambiguous (%0 and %1)">;
  def err_typecheck_sve_gnu_ambiguous : Error<
 diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
-index c159eb431cbd..fad042c33bc8 100644
+index ade04110dfd2..eb3835c08ede 100644
 --- a/clang/include/clang/Basic/TokenKinds.def
 +++ b/clang/include/clang/Basic/TokenKinds.def
-@@ -742,6 +742,7 @@ ALIAS("__char32_t"   , char32_t          , KEYCXX)
+@@ -743,6 +743,7 @@ ALIAS("__char32_t"   , char32_t          , KEYCXX)
  KEYWORD(__builtin_bit_cast               , KEYALL)
  KEYWORD(__builtin_available              , KEYALL)
  KEYWORD(__builtin_sycl_unique_stable_name, KEYSYCL)
@@ -176,18 +176,19 @@ index c159eb431cbd..fad042c33bc8 100644
  // Clang-specific keywords enabled only in testing.
  TESTING_KEYWORD(__unknown_anytype , KEYALL)
 diff --git a/clang/lib/Parse/ParseDecl.cpp b/clang/lib/Parse/ParseDecl.cpp
-index 74893dee2123..eab709b2dcf5 100644
+index 6465d859b1da..558f269bb1ba 100644
 --- a/clang/lib/Parse/ParseDecl.cpp
 +++ b/clang/lib/Parse/ParseDecl.cpp
-@@ -3782,6 +3782,14 @@ void Parser::ParseDeclarationSpecifiers(
+@@ -3794,6 +3794,15 @@ void Parser::ParseDeclarationSpecifiers(
        ParseAttributes(PAKM_GNU | PAKM_Declspec, DS.getAttributes(), LateAttrs);
        continue;
  
 +    case tok::kw___disable_adl: {
-+      IdentifierInfo* AttrName = Tok.getIdentifierInfo();
++      IdentifierInfo *AttrName = Tok.getIdentifierInfo();
 +      SourceLocation AttrNameLoc = Tok.getLocation();
-+      DS.getAttributes().addNew(AttrName, AttrNameLoc, nullptr, AttrNameLoc,
-+                                nullptr, 0, ParsedAttr::AS_Keyword);
++      DS.getAttributes().addNew(
++          AttrName, AttrNameLoc, /*scopeName=*/nullptr, AttrNameLoc,
++          /*args=*/nullptr, /*NumArgs=*/0, ParsedAttr::AS_Keyword);
 +      break;
 +    }
 +
@@ -195,16 +196,18 @@ index 74893dee2123..eab709b2dcf5 100644
      case tok::kw___forceinline: {
        isInvalid = DS.setFunctionSpecForceInline(Loc, PrevSpec, DiagID);
 diff --git a/clang/lib/Sema/SemaDeclAttr.cpp b/clang/lib/Sema/SemaDeclAttr.cpp
-index b3bde19b2cb7..7e14eae664b2 100644
+index 1a0bfb3d91bc..c4469a52c117 100644
 --- a/clang/lib/Sema/SemaDeclAttr.cpp
 +++ b/clang/lib/Sema/SemaDeclAttr.cpp
-@@ -5652,6 +5652,14 @@ static void handleBuiltinAliasAttr(Sema &S, Decl *D,
+@@ -5751,6 +5751,16 @@ static void handleBuiltinAliasAttr(Sema &S, Decl *D,
    D->addAttr(::new (S.Context) BuiltinAliasAttr(S.Context, AL, Ident));
  }
  
 +static void handleDisableADLAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
-+  if (FunctionDecl *F = D->getAsFunction(); F->isOverloadedOperator() || F->isCXXClassMember()) {
-+    S.Diag(AL.getLoc(), diag::err_disable_adl_no_operators) << F->isCXXClassMember();
++  if (FunctionDecl *F = D->getAsFunction();
++      F->isOverloadedOperator() || F->isCXXClassMember()) {
++    S.Diag(AL.getLoc(), diag::err_disable_adl_no_operators)
++        << F->isCXXClassMember();
 +    return;
 +  }
 +  D->addAttr(::new (S.Context) DisableADLAttr(S.Context, AL));
@@ -213,7 +216,7 @@ index b3bde19b2cb7..7e14eae664b2 100644
  //===----------------------------------------------------------------------===//
  // Checker-specific attribute handlers.
  //===----------------------------------------------------------------------===//
-@@ -9245,6 +9253,10 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
+@@ -9356,6 +9366,10 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
    case ParsedAttr::AT_UsingIfExists:
      handleSimpleAttribute<UsingIfExistsAttr>(S, D, AL);
      break;
@@ -225,10 +228,10 @@ index b3bde19b2cb7..7e14eae664b2 100644
  }
  
 diff --git a/clang/lib/Sema/SemaLookup.cpp b/clang/lib/Sema/SemaLookup.cpp
-index c73acf161993..ca43ff739150 100644
+index b910974d2ce6..2849d11f79e1 100644
 --- a/clang/lib/Sema/SemaLookup.cpp
 +++ b/clang/lib/Sema/SemaLookup.cpp
-@@ -3858,6 +3858,9 @@ void Sema::ArgumentDependentLookup(DeclarationName Name, SourceLocation Loc,
+@@ -3873,6 +3873,9 @@ void Sema::ArgumentDependentLookup(DeclarationName Name, SourceLocation Loc,
            !isa<FunctionTemplateDecl>(Underlying))
          continue;
  
@@ -239,10 +242,10 @@ index c73acf161993..ca43ff739150 100644
        // it's ordinarily visible or declared as a friend in an associated
        // class.
 diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
-index 04bf59485c80..4dcaccb2f679 100644
+index ac4c79756a01..6c2bc925c9c6 100644
 --- a/clang/lib/Sema/SemaOverload.cpp
 +++ b/clang/lib/Sema/SemaOverload.cpp
-@@ -6514,7 +6514,7 @@ void Sema::AddOverloadCandidate(
+@@ -6513,7 +6513,7 @@ void Sema::AddOverloadCandidate(
        NamedDecl *ND = Function;
        if (auto *SpecInfo = Function->getTemplateSpecializationInfo())
          ND = SpecInfo->getTemplate();
@@ -251,13 +254,22 @@ index 04bf59485c80..4dcaccb2f679 100644
        if (ND->getFormalLinkage() == Linkage::InternalLinkage) {
          Candidate.Viable = false;
          Candidate.FailureKind = ovl_fail_module_mismatched;
-@@ -12906,12 +12906,20 @@ static void AddOverloadedCallCandidate(Sema &S,
-                                        ArrayRef<Expr *> Args,
-                                        OverloadCandidateSet &CandidateSet,
-                                        bool PartialOverloading,
+@@ -12917,18 +12917,20 @@ bool Sema::ResolveAndFixSingleFunctionTemplateSpecialization(
+ }
+ 
+ /// Add a single candidate to the overload set.
+-static void AddOverloadedCallCandidate(Sema &S,
+-                                       DeclAccessPair FoundDecl,
+-                                 TemplateArgumentListInfo *ExplicitTemplateArgs,
+-                                       ArrayRef<Expr *> Args,
+-                                       OverloadCandidateSet &CandidateSet,
+-                                       bool PartialOverloading,
 -                                       bool KnownValid) {
-+                                       bool KnownValid,
-+                                       UnresolvedLookupExpr* ULE) {
++static void AddOverloadedCallCandidate(
++    Sema &S, DeclAccessPair FoundDecl,
++    TemplateArgumentListInfo *ExplicitTemplateArgs, ArrayRef<Expr *> Args,
++    OverloadCandidateSet &CandidateSet, bool PartialOverloading,
++    bool KnownValid, UnresolvedLookupExpr *ULE) {
    NamedDecl *Callee = FoundDecl.getDecl();
    if (isa<UsingShadowDecl>(Callee))
      Callee = cast<UsingShadowDecl>(Callee)->getTargetDecl();
@@ -266,46 +278,41 @@ index 04bf59485c80..4dcaccb2f679 100644
 +    if (Func->hasAttr<DisableADLAttr>() && ULE) {
 +      ULE->disableADL();
 +    }
-+    // else if (!CandidateSet.empty() && CandidateSet.begin()->FoundDecl->hasAttr<DisableADLAttr>()) {
-+    //   return;
-+    // }
 +
      if (ExplicitTemplateArgs) {
        assert(!KnownValid && "Explicit template arguments?");
        return;
-@@ -12928,6 +12936,13 @@ static void AddOverloadedCallCandidate(Sema &S,
+@@ -12945,6 +12947,10 @@ static void AddOverloadedCallCandidate(Sema &S,
  
    if (FunctionTemplateDecl *FuncTemplate
        = dyn_cast<FunctionTemplateDecl>(Callee)) {
 +    if (FuncTemplate->getAsFunction()->hasAttr<DisableADLAttr>() && ULE) {
 +      ULE->disableADL();
 +    }
-+    // else if (!CandidateSet.empty() && CandidateSet.begin()->FoundDecl->hasAttr<DisableADLAttr>()) {
-+    //   return;
-+    // }
 +
      S.AddTemplateOverloadCandidate(FuncTemplate, FoundDecl,
                                     ExplicitTemplateArgs, Args, CandidateSet,
                                     /*SuppressUserConversions=*/false,
-@@ -12986,7 +13001,7 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
+@@ -13003,7 +13009,7 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
           E = ULE->decls_end(); I != E; ++I)
      AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
                                 CandidateSet, PartialOverloading,
 -                               /*KnownValid*/ true);
-+                               /*KnownValid*/ true, ULE);
++                               /*KnownValid=*/true, ULE);
  
    if (ULE->requiresADL())
      AddArgumentDependentLookupCandidates(ULE->getName(), ULE->getExprLoc(),
-@@ -13001,7 +13016,7 @@ void Sema::AddOverloadedCallCandidates(
+@@ -13018,7 +13024,8 @@ void Sema::AddOverloadedCallCandidates(
      ArrayRef<Expr *> Args, OverloadCandidateSet &CandidateSet) {
    for (LookupResult::iterator I = R.begin(), E = R.end(); I != E; ++I)
      AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
 -                               CandidateSet, false, /*KnownValid*/ false);
-+                               CandidateSet, false, /*KnownValid*/ false, nullptr);
++                               CandidateSet, false, /*KnownValid*/ false,
++                               nullptr);
  }
  
  /// Determine whether a declaration with the specified name could be moved into
-@@ -13947,8 +13962,8 @@ Sema::CreateOverloadedBinOp(SourceLocation OpLoc, BinaryOperatorKind Opc,
+@@ -13964,8 +13971,8 @@ Sema::CreateOverloadedBinOp(SourceLocation OpLoc, BinaryOperatorKind Opc,
                Diag(FnDecl->getLocation(),
                     diag::note_ovl_ambiguous_oper_binary_reversed_self);
                // Mark member== const or provide matching != to disallow reversed
@@ -502,5 +509,5 @@ index 000000000000..fb10e39ee338
 +  requires { p1 > p2; }; // expected-warning 2 {{expression result unused}}
 +}
 -- 
-2.39.0.314.g84b9a713c41-goog
+2.39.2.637.g21b0678d19-goog
 

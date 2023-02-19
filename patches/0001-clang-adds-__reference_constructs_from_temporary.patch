@@ -1,4 +1,4 @@
-From c98c82b2b49453047b5c964ae52bf455495dd9f4 Mon Sep 17 00:00:00 2001
+From 4561cb5b685151a8a1eb86768cea40aed445e5b0 Mon Sep 17 00:00:00 2001
 From: Christopher Di Bella <cjdb.ns@gmail.com>
 Date: Sat, 22 Oct 2022 22:54:38 -0700
 Subject: [PATCH 1/3] adds `__reference_constructs_from_temporary`
@@ -21,10 +21,10 @@ Differential Revision: https://reviews.llvm.org/D135341
  9 files changed, 90 insertions(+), 10 deletions(-)
 
 diff --git a/clang/docs/LanguageExtensions.rst b/clang/docs/LanguageExtensions.rst
-index 9b39dc23e0a5..836f6a9ee8e8 100644
+index 2d1b8af40bbb..9f258f62df66 100644
 --- a/clang/docs/LanguageExtensions.rst
 +++ b/clang/docs/LanguageExtensions.rst
-@@ -1508,6 +1508,7 @@ The following type trait primitives are supported by Clang. Those traits marked
+@@ -1516,6 +1516,7 @@ The following type trait primitives are supported by Clang. Those traits marked
    materialized temporary object. If ``T`` is not a reference type the result
    is false. Note this trait will also return false when the initialization of
    ``T`` from ``U`` is ill-formed.
@@ -45,12 +45,12 @@ index c59adcc72a68..461e8dc46bdf 100644
 +  "%0 is a compiler-reserved identifier for a future feature">;
  }
 diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
-index 96feae991ccb..c159eb431cbd 100644
+index b9da4711a5c2..ade04110dfd2 100644
 --- a/clang/include/clang/Basic/TokenKinds.def
 +++ b/clang/include/clang/Basic/TokenKinds.def
-@@ -524,6 +524,8 @@ TYPE_TRAIT_1(__is_nullptr, IsNullPointer, KEYCXX)
- TYPE_TRAIT_1(__is_scoped_enum, IsScopedEnum, KEYCXX)
+@@ -525,6 +525,8 @@ TYPE_TRAIT_1(__is_scoped_enum, IsScopedEnum, KEYCXX)
  TYPE_TRAIT_1(__is_referenceable, IsReferenceable, KEYCXX)
+ TYPE_TRAIT_1(__can_pass_in_regs, CanPassInRegs, KEYCXX)
  TYPE_TRAIT_2(__reference_binds_to_temporary, ReferenceBindsToTemporary, KEYCXX)
 +TYPE_TRAIT_2(__reference_constructs_from_temporary, ReferenceConstructsFromTemporary, KEYCXX)
 +TYPE_TRAIT_2(__reference_converts_from_temporary, ReferenceConvertsFromTemporary, KEYCXX)
@@ -58,7 +58,7 @@ index 96feae991ccb..c159eb431cbd 100644
  // Embarcadero Expression Traits
  EXPRESSION_TRAIT(__is_lvalue_expr, IsLValueExpr, KEYCXX)
 diff --git a/clang/lib/Lex/PPMacroExpansion.cpp b/clang/lib/Lex/PPMacroExpansion.cpp
-index 9262d1c2ad83..0780ccae1334 100644
+index bbc271e5611e..875276ddf3f0 100644
 --- a/clang/lib/Lex/PPMacroExpansion.cpp
 +++ b/clang/lib/Lex/PPMacroExpansion.cpp
 @@ -1722,6 +1722,8 @@ void Preprocessor::ExpandBuiltinMacro(Token &Tok) {
@@ -71,10 +71,10 @@ index 9262d1c2ad83..0780ccae1334 100644
  #include "clang/Basic/TransformTypeTraits.def"
                .Default(false);
 diff --git a/clang/lib/Parse/ParseDeclCXX.cpp b/clang/lib/Parse/ParseDeclCXX.cpp
-index 53afdd7e7291..9f19e1cbb224 100644
+index c7d8eb0af99d..112c224882a3 100644
 --- a/clang/lib/Parse/ParseDeclCXX.cpp
 +++ b/clang/lib/Parse/ParseDeclCXX.cpp
-@@ -1632,7 +1632,10 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
+@@ -1629,7 +1629,10 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
            tok::kw___is_union,
            tok::kw___is_unsigned,
            tok::kw___is_void,
@@ -87,10 +87,10 @@ index 53afdd7e7291..9f19e1cbb224 100644
      // name of struct templates, but some are keywords in GCC >= 4.3
      // and Clang. Therefore, when we see the token sequence "struct
 diff --git a/clang/lib/Parse/ParseExpr.cpp b/clang/lib/Parse/ParseExpr.cpp
-index 95d8b649f19b..e910b48c195b 100644
+index 66d937ac5742..3015cd6a9b7b 100644
 --- a/clang/lib/Parse/ParseExpr.cpp
 +++ b/clang/lib/Parse/ParseExpr.cpp
-@@ -1123,6 +1123,9 @@ ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
+@@ -1124,6 +1124,9 @@ ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
            REVERTIBLE_TYPE_TRAIT(__is_unsigned);
            REVERTIBLE_TYPE_TRAIT(__is_void);
            REVERTIBLE_TYPE_TRAIT(__is_volatile);
@@ -101,7 +101,7 @@ index 95d8b649f19b..e910b48c195b 100644
    REVERTIBLE_TYPE_TRAIT(RTT_JOIN(__, Trait));
  #include "clang/Basic/TransformTypeTraits.def"
 diff --git a/clang/lib/Sema/SemaExprCXX.cpp b/clang/lib/Sema/SemaExprCXX.cpp
-index f73abdbdd197..9020e0421c02 100644
+index eb9a3e65763f..8d1337697c7d 100644
 --- a/clang/lib/Sema/SemaExprCXX.cpp
 +++ b/clang/lib/Sema/SemaExprCXX.cpp
 @@ -29,6 +29,7 @@
@@ -112,7 +112,7 @@ index f73abdbdd197..9020e0421c02 100644
  #include "clang/Lex/Preprocessor.h"
  #include "clang/Sema/DeclSpec.h"
  #include "clang/Sema/Initialization.h"
-@@ -5392,14 +5393,15 @@ static bool evaluateTypeTrait(Sema &S, TypeTrait Kind, SourceLocation KWLoc,
+@@ -5391,14 +5392,15 @@ static bool evaluateTypeTrait(Sema &S, TypeTrait Kind, SourceLocation KWLoc,
    if (Kind <= UTT_Last)
      return EvaluateUnaryTypeTrait(S, Kind, KWLoc, Args[0]->getType());
  
@@ -131,7 +131,7 @@ index f73abdbdd197..9020e0421c02 100644
    case clang::TT_IsConstructible:
    case clang::TT_IsNothrowConstructible:
    case clang::TT_IsTriviallyConstructible: {
-@@ -5476,11 +5478,23 @@ static bool evaluateTypeTrait(Sema &S, TypeTrait Kind, SourceLocation KWLoc,
+@@ -5475,11 +5477,23 @@ static bool evaluateTypeTrait(Sema &S, TypeTrait Kind, SourceLocation KWLoc,
      if (Kind == clang::TT_IsConstructible)
        return true;
  
@@ -157,7 +157,7 @@ index f73abdbdd197..9020e0421c02 100644
      }
  
      if (Kind == clang::TT_IsNothrowConstructible)
-@@ -5668,6 +5682,10 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
+@@ -5667,6 +5681,10 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
      QualType Rhs = Self.getASTContext().getUnqualifiedArrayType(RhsT, RhsQuals);
      return Self.Context.typesAreCompatible(Lhs, Rhs);
    }
@@ -169,7 +169,7 @@ index f73abdbdd197..9020e0421c02 100644
    case BTT_IsConvertibleTo: {
      // C++0x [meta.rel]p4:
 diff --git a/clang/test/SemaCXX/type-traits.cpp b/clang/test/SemaCXX/type-traits.cpp
-index 76a67252c941..1c94ad5aed3e 100644
+index 7d425acb5681..28e771092b82 100644
 --- a/clang/test/SemaCXX/type-traits.cpp
 +++ b/clang/test/SemaCXX/type-traits.cpp
 @@ -2537,6 +2537,55 @@ void reference_binds_to_temporary_checks() {
@@ -229,10 +229,10 @@ index 76a67252c941..1c94ad5aed3e 100644
    int t01[T(__array_rank(IntAr) == 1)];
    int t02[T(__array_rank(ConstIntArAr) == 2)];
 diff --git a/clang/www/cxx_status.html b/clang/www/cxx_status.html
-index c9df1ed37350..82febc23c0a5 100755
+index f93a788aa0d7..75b7f9f5325d 100755
 --- a/clang/www/cxx_status.html
 +++ b/clang/www/cxx_status.html
-@@ -1419,10 +1419,9 @@ C++20, informally referred to as C++2b.</p>
+@@ -1427,10 +1427,9 @@ C++20, informally referred to as C++2b.</p>
        <td><a href="https://wg21.link/P2255R2">P2255R2</a></td>
        <td class="partial" align="center">
          <details><summary>Partial</summary>
@@ -247,5 +247,5 @@ index c9df1ed37350..82febc23c0a5 100755
            traits requiring compiler support directly.
          </details></td>
 -- 
-2.39.0.314.g84b9a713c41-goog
+2.39.2.637.g21b0678d19-goog
 
