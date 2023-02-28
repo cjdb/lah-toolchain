@@ -10,9 +10,10 @@ jobs:
     name: Build LLVM
     runs-on: ${{ matrix.os }}
     env:
-      CC: /usr/bin/clang-17
-      CXX: /usr/bin/clang++-17
+      CC: /tmp/llvm/bin/clang
+      CXX: /tmp/llvm/bin/clang++
       artifact-path: llvm-${{ matrix.target.triple }}.tar.xz
+      LD_LIBRARY_PATH: "/tmp/llvm/lib:/tmp/llvm/lib/${{ matrix.toolchain }}:/usr/lib"
     strategy:
       fail-fast: false
       matrix:
@@ -31,27 +32,16 @@ jobs:
       - name: Install tools
         id: install_tools
         run: |
-          sudo wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add -
-          sudo apt-add-repository 'deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy main'
           sudo apt-get update
           sudo apt-get autoremove -y
           sudo apt-get remove -y clang-* llvm-*
           sudo apt-get install -y                   \
             binutils${{ matrix.target.gcc-triple }} \
             bzip2                                   \
-            clang                                   \
-            clang-tidy                              \
-            clang-tools                             \
-            gcc-10${{ matrix.target.gcc-triple }}   \
-            g++-10${{ matrix.target.gcc-triple }}   \
-            glibc-source                            \
-            libc++-17-dev                           \
-            libc++abi-17-dev                        \
+            gcc-11${{ matrix.target.gcc-triple }}   \
+            g++-11${{ matrix.target.gcc-triple }}   \
             libedit-dev                             \
             libz3-dev                               \
-            lld                                     \
-            llvm                                    \
-            llvm-17-tools                           \
             lua5.3                                  \
             ninja-build                             \
             python3                                 \
@@ -59,6 +49,21 @@ jobs:
             swig4.0
           sudo python3 -m pip install pip --upgrade
           sudo python3 -m pip install cmake
+
+      - name: Download and extract LLVM toolchain
+        working-directory: /tmp
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="cjdb/lah-toolchain"
+          WF_NAME="toolchain-release"
+          ARTIFACT_NAME="llvm-x86_64-unknown-linux-gnu.tar.xz"
+          for i in $(seq 1 100); do
+            RUN_ID=`gh run --repo ${REPO} list --workflow ${WF_NAME} --json databaseId --jq .[$i].databaseId` || exit 1
+            gh run --repo ${REPO} download ${RUN_ID} -n ${ARTIFACT_NAME} || continue
+            break
+          done
+          tar -xvf ${ARTIFACT_NAME}
 
       - name: Checkout lah-toolchain
         uses: actions/checkout@v3
