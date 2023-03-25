@@ -1,4 +1,4 @@
-From 4561cb5b685151a8a1eb86768cea40aed445e5b0 Mon Sep 17 00:00:00 2001
+From 1238216a6b4cf9f1c1de809150c3fe954ae04a82 Mon Sep 17 00:00:00 2001
 From: Christopher Di Bella <cjdb.ns@gmail.com>
 Date: Sat, 22 Oct 2022 22:54:38 -0700
 Subject: [PATCH 1/3] adds `__reference_constructs_from_temporary`
@@ -21,10 +21,10 @@ Differential Revision: https://reviews.llvm.org/D135341
  9 files changed, 90 insertions(+), 10 deletions(-)
 
 diff --git a/clang/docs/LanguageExtensions.rst b/clang/docs/LanguageExtensions.rst
-index 2d1b8af40bbb..9f258f62df66 100644
+index f8c83d4d6d16..1f39cd75ed9e 100644
 --- a/clang/docs/LanguageExtensions.rst
 +++ b/clang/docs/LanguageExtensions.rst
-@@ -1516,6 +1516,7 @@ The following type trait primitives are supported by Clang. Those traits marked
+@@ -1519,6 +1519,7 @@ The following type trait primitives are supported by Clang. Those traits marked
    materialized temporary object. If ``T`` is not a reference type the result
    is false. Note this trait will also return false when the initialization of
    ``T`` from ``U`` is ill-formed.
@@ -33,7 +33,7 @@ index 2d1b8af40bbb..9f258f62df66 100644
  
  In addition, the following expression traits are supported:
 diff --git a/clang/include/clang/Basic/DiagnosticCommonKinds.td b/clang/include/clang/Basic/DiagnosticCommonKinds.td
-index c59adcc72a68..461e8dc46bdf 100644
+index 9b8103c97e39..aa786539c75a 100644
 --- a/clang/include/clang/Basic/DiagnosticCommonKinds.td
 +++ b/clang/include/clang/Basic/DiagnosticCommonKinds.td
 @@ -405,4 +405,7 @@ def err_opencl_extension_and_feature_differs : Error<
@@ -45,10 +45,10 @@ index c59adcc72a68..461e8dc46bdf 100644
 +  "%0 is a compiler-reserved identifier for a future feature">;
  }
 diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
-index b9da4711a5c2..ade04110dfd2 100644
+index 28862c81e9ee..ab7f7c2b4b34 100644
 --- a/clang/include/clang/Basic/TokenKinds.def
 +++ b/clang/include/clang/Basic/TokenKinds.def
-@@ -525,6 +525,8 @@ TYPE_TRAIT_1(__is_scoped_enum, IsScopedEnum, KEYCXX)
+@@ -526,6 +526,8 @@ TYPE_TRAIT_1(__is_scoped_enum, IsScopedEnum, KEYCXX)
  TYPE_TRAIT_1(__is_referenceable, IsReferenceable, KEYCXX)
  TYPE_TRAIT_1(__can_pass_in_regs, CanPassInRegs, KEYCXX)
  TYPE_TRAIT_2(__reference_binds_to_temporary, ReferenceBindsToTemporary, KEYCXX)
@@ -58,10 +58,10 @@ index b9da4711a5c2..ade04110dfd2 100644
  // Embarcadero Expression Traits
  EXPRESSION_TRAIT(__is_lvalue_expr, IsLValueExpr, KEYCXX)
 diff --git a/clang/lib/Lex/PPMacroExpansion.cpp b/clang/lib/Lex/PPMacroExpansion.cpp
-index bbc271e5611e..875276ddf3f0 100644
+index a14fdcda58e0..d75f1fa9ec4c 100644
 --- a/clang/lib/Lex/PPMacroExpansion.cpp
 +++ b/clang/lib/Lex/PPMacroExpansion.cpp
-@@ -1722,6 +1722,8 @@ void Preprocessor::ExpandBuiltinMacro(Token &Tok) {
+@@ -1695,6 +1695,8 @@ void Preprocessor::ExpandBuiltinMacro(Token &Tok) {
                .Case("__array_rank", true)
                .Case("__array_extent", true)
                .Case("__reference_binds_to_temporary", true)
@@ -71,10 +71,10 @@ index bbc271e5611e..875276ddf3f0 100644
  #include "clang/Basic/TransformTypeTraits.def"
                .Default(false);
 diff --git a/clang/lib/Parse/ParseDeclCXX.cpp b/clang/lib/Parse/ParseDeclCXX.cpp
-index c7d8eb0af99d..112c224882a3 100644
+index 037bc869c5a1..f35b297477c7 100644
 --- a/clang/lib/Parse/ParseDeclCXX.cpp
 +++ b/clang/lib/Parse/ParseDeclCXX.cpp
-@@ -1629,7 +1629,10 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
+@@ -1631,7 +1631,10 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
            tok::kw___is_union,
            tok::kw___is_unsigned,
            tok::kw___is_void,
@@ -87,10 +87,10 @@ index c7d8eb0af99d..112c224882a3 100644
      // name of struct templates, but some are keywords in GCC >= 4.3
      // and Clang. Therefore, when we see the token sequence "struct
 diff --git a/clang/lib/Parse/ParseExpr.cpp b/clang/lib/Parse/ParseExpr.cpp
-index 66d937ac5742..3015cd6a9b7b 100644
+index 554113c5a27c..ed64cfc609dc 100644
 --- a/clang/lib/Parse/ParseExpr.cpp
 +++ b/clang/lib/Parse/ParseExpr.cpp
-@@ -1124,6 +1124,9 @@ ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
+@@ -1125,6 +1125,9 @@ ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
            REVERTIBLE_TYPE_TRAIT(__is_unsigned);
            REVERTIBLE_TYPE_TRAIT(__is_void);
            REVERTIBLE_TYPE_TRAIT(__is_volatile);
@@ -101,7 +101,7 @@ index 66d937ac5742..3015cd6a9b7b 100644
    REVERTIBLE_TYPE_TRAIT(RTT_JOIN(__, Trait));
  #include "clang/Basic/TransformTypeTraits.def"
 diff --git a/clang/lib/Sema/SemaExprCXX.cpp b/clang/lib/Sema/SemaExprCXX.cpp
-index eb9a3e65763f..8d1337697c7d 100644
+index e7f3852ae34c..05ca672a6809 100644
 --- a/clang/lib/Sema/SemaExprCXX.cpp
 +++ b/clang/lib/Sema/SemaExprCXX.cpp
 @@ -29,6 +29,7 @@
@@ -229,10 +229,10 @@ index 7d425acb5681..28e771092b82 100644
    int t01[T(__array_rank(IntAr) == 1)];
    int t02[T(__array_rank(ConstIntArAr) == 2)];
 diff --git a/clang/www/cxx_status.html b/clang/www/cxx_status.html
-index f93a788aa0d7..75b7f9f5325d 100755
+index 79cfca34fb4f..2226747091bf 100755
 --- a/clang/www/cxx_status.html
 +++ b/clang/www/cxx_status.html
-@@ -1427,10 +1427,9 @@ C++20, informally referred to as C++2b.</p>
+@@ -1432,10 +1432,9 @@ C++20, informally referred to as C++2b.</p>
        <td><a href="https://wg21.link/P2255R2">P2255R2</a></td>
        <td class="partial" align="center">
          <details><summary>Partial</summary>
@@ -247,5 +247,5 @@ index f93a788aa0d7..75b7f9f5325d 100755
            traits requiring compiler support directly.
          </details></td>
 -- 
-2.39.2.637.g21b0678d19-goog
+2.40.0.348.gf938b09366-goog
 
