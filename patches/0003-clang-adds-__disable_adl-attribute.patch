@@ -1,7 +1,7 @@
-From 4855e11e2b585adcae58175a53d8dc039f20449e Mon Sep 17 00:00:00 2001
-From: Christopher Di Bella <cjdb.ns@gmail.com>
-Date: Sun, 23 Oct 2022 00:37:32 -0700
-Subject: [PATCH 3/3] adds `__disable_adl` attribute
+From 5eed2cc4d3613e501f47784a587125d82a93092b Mon Sep 17 00:00:00 2001
+From: Christopher Di Bella <cjdb@google.com>
+Date: Thu, 20 Apr 2023 21:18:39 +0000
+Subject: [PATCH] [clang] adds `__disable_adl` attribute
 
 Certain library functions need to disable ADL. For example, the functions
 in [range.iter.ops]/2 and [algorithms.requirements]/2 require functions
@@ -25,19 +25,19 @@ Differential Revision: https://reviews.llvm.org/D129951
 ---
  clang/include/clang/AST/ExprCXX.h             |   3 +
  clang/include/clang/Basic/Attr.td             |   7 +
- clang/include/clang/Basic/AttrDocs.td         |  40 ++--
+ clang/include/clang/Basic/AttrDocs.td         |  70 ++++++-
  .../clang/Basic/DiagnosticSemaKinds.td        |   3 +
  clang/include/clang/Basic/TokenKinds.def      |   1 +
  clang/lib/Parse/ParseDecl.cpp                 |   9 +
- clang/lib/Sema/SemaDeclAttr.cpp               |  14 ++
+ clang/lib/Sema/SemaDeclAttr.cpp               |  16 +-
  clang/lib/Sema/SemaLookup.cpp                 |   3 +
- clang/lib/Sema/SemaOverload.cpp               |  31 +--
+ clang/lib/Sema/SemaOverload.cpp               |  27 ++-
  clang/test/SemaCXX/disable-adl.cpp            | 179 ++++++++++++++++++
- 10 files changed, 260 insertions(+), 30 deletions(-)
+ 10 files changed, 305 insertions(+), 13 deletions(-)
  create mode 100644 clang/test/SemaCXX/disable-adl.cpp
 
 diff --git a/clang/include/clang/AST/ExprCXX.h b/clang/include/clang/AST/ExprCXX.h
-index 032fd199b030..3a59b93e6d92 100644
+index 724904b4d204..6e47a96d04f6 100644
 --- a/clang/include/clang/AST/ExprCXX.h
 +++ b/clang/include/clang/AST/ExprCXX.h
 @@ -3214,6 +3214,9 @@ public:
@@ -51,10 +51,10 @@ index 032fd199b030..3a59b93e6d92 100644
    bool isOverloaded() const { return UnresolvedLookupExprBits.Overloaded; }
  
 diff --git a/clang/include/clang/Basic/Attr.td b/clang/include/clang/Basic/Attr.td
-index 3e086ebee6a4..0c0156336142 100644
+index a23dd5ce3634..ad219a2dcd86 100644
 --- a/clang/include/clang/Basic/Attr.td
 +++ b/clang/include/clang/Basic/Attr.td
-@@ -4150,3 +4150,10 @@ def ReadOnlyPlacement : InheritableAttr {
+@@ -4158,3 +4158,10 @@ def ReadOnlyPlacement : InheritableAttr {
    let Subjects = SubjectList<[Record]>;
    let Documentation = [ReadOnlyPlacementDocs];
  }
@@ -66,83 +66,10 @@ index 3e086ebee6a4..0c0156336142 100644
 +  let LangOpts = [CPlusPlus];
 +}
 diff --git a/clang/include/clang/Basic/AttrDocs.td b/clang/include/clang/Basic/AttrDocs.td
-index 1bb9e691725d..4dfc427f336d 100644
+index dae12624a822..6a2cab5ffa5c 100644
 --- a/clang/include/clang/Basic/AttrDocs.td
 +++ b/clang/include/clang/Basic/AttrDocs.td
-@@ -539,16 +539,16 @@ def NoMergeDocs : Documentation {
-   let Category = DocCatStmt;
-   let Content = [{
- If a statement is marked ``nomerge`` and contains call expressions, those call
--expressions inside the statement will not be merged during optimization. This 
-+expressions inside the statement will not be merged during optimization. This
- attribute can be used to prevent the optimizer from obscuring the source
- location of certain calls. For example, it will prevent tail merging otherwise
- identical code sequences that raise an exception or terminate the program. Tail
- merging normally reduces the precision of source location information, making
- stack traces less useful for debugging. This attribute gives the user control
--over the tradeoff between code size and debug information precision. 
-+over the tradeoff between code size and debug information precision.
- 
--``nomerge`` attribute can also be used as function attribute to prevent all 
--calls to the specified function from merging. It has no effect on indirect 
-+``nomerge`` attribute can also be used as function attribute to prevent all
-+calls to the specified function from merging. It has no effect on indirect
- calls.
-   }];
- }
-@@ -1581,7 +1581,7 @@ attributes are ignored. Supported platforms are:
- ``watchos``
-   Apple's watchOS operating system. The minimum deployment target is specified by
-   the ``-mwatchos-version-min=*version*`` command-line argument.
--  
-+
- ``driverkit``
-   Apple's DriverKit userspace kernel extensions. The minimum deployment target
-   is specified as part of the triple.
-@@ -3896,7 +3896,7 @@ Whether a particular pointer may be "null" is an important concern when working
- with pointers in the C family of languages. The various nullability attributes
- indicate whether a particular pointer can be null or not, which makes APIs more
- expressive and can help static analysis tools identify bugs involving null
--pointers. Clang supports several kinds of nullability attributes: the 
-+pointers. Clang supports several kinds of nullability attributes: the
- ``nonnull`` and ``returns_nonnull`` attributes indicate which function or
- method parameters and result types can never be null, while nullability type
- qualifiers indicate which pointer types can be null (``_Nullable``) or cannot
-@@ -4072,7 +4072,7 @@ memory is not available rather than returning a null pointer:
- The ``returns_nonnull`` attribute implies that returning a null pointer is
- undefined behavior, which the optimizer may take advantage of. The ``_Nonnull``
- type qualifier indicates that a pointer cannot be null in a more general manner
--(because it is part of the type system) and does not imply undefined behavior, 
-+(because it is part of the type system) and does not imply undefined behavior,
- making it more widely applicable
- }];
- }
-@@ -6021,15 +6021,15 @@ def CFGuardDocs : Documentation {
-   let Content = [{
- Code can indicate CFG checks are not wanted with the ``__declspec(guard(nocf))``
- attribute. This directs the compiler to not insert any CFG checks for the entire
--function. This approach is typically used only sparingly in specific situations 
--where the programmer has manually inserted "CFG-equivalent" protection. The 
--programmer knows that they are calling through some read-only function table 
--whose address is obtained through read-only memory references and for which the 
--index is masked to the function table limit. This approach may also be applied 
--to small wrapper functions that are not inlined and that do nothing more than 
--make a call through a function pointer. Since incorrect usage of this directive 
--can compromise the security of CFG, the programmer must be very careful using 
--the directive. Typically, this usage is limited to very small functions that 
-+function. This approach is typically used only sparingly in specific situations
-+where the programmer has manually inserted "CFG-equivalent" protection. The
-+programmer knows that they are calling through some read-only function table
-+whose address is obtained through read-only memory references and for which the
-+index is masked to the function table limit. This approach may also be applied
-+to small wrapper functions that are not inlined and that do nothing more than
-+make a call through a function pointer. Since incorrect usage of this directive
-+can compromise the security of CFG, the programmer must be very careful using
-+the directive. Typically, this usage is limited to very small functions that
- only call one function.
- 
- `Control Flow Guard documentation <https://docs.microsoft.com/en-us/windows/win32/secbp/pe-metadata>`
-@@ -6942,8 +6942,12 @@ def ReadOnlyPlacementDocs : Documentation {
+@@ -6945,8 +6945,74 @@ def ReadOnlyPlacementDocs : Documentation {
  def WebAssemblyFuncrefDocs : Documentation {
    let Category = DocCatType;
    let Content = [{
@@ -155,27 +82,89 @@ index 1bb9e691725d..4dfc427f336d 100644
  }
 +
 +def DisableADLDocs : Documentation {
-+  let Content = [{Please don't LGTM without this being fully documented.}];
++  let Category = DocCatType;
++  let Content = [{
++    This attribute informs the compiler that overloads in the immediate scope should not be found by
++    argument-dependent lookup (ADL), and that when found by unqualified name lookup, they inhibit
++    ADL. This is useful for implementing libraries whose design is not centred around ADL, but wish
++    to continue writing functions as opposed to function objects (which can impact build times).
++
++    Example:
++
++    .. code-block:: cpp
++
++      namespace NS1 {
++        struct S1 {};
++        S1 inhibited(S1); // expected-note 2 {{candidate function}}
++
++        namespace NNS1 {
++          struct S2 {};
++          __disable_adl void hidden(S2);   // expected-note{{declared here}}
++          __disable_adl int inhibited(S1); // expected-note 4 {{candidate function}}
++        }
++      }
++
++      namespace NS2 {
++        __disable_adl void inhibited(NS1::S1); // expected-note 2 {{candidate function}}
++      }
++
++      int main()
++      {
++        NS1::S1 s;
++        hidden(s); // error: use of undeclared identifier 'hidden'; did you mean 'NS::NNS::hidden'?
++        {
++          NS1::S1 x = inhibited(NS1::S1{}); // no error
++        }
++        {
++          using namespace NS1::NNS1;
++          int x = inhibited(NS1::S1{}); // no error
++
++          using namespace NS1;
++          S1 y = inhibited(NS1::S1{}); // error: call to 'inhibited' is ambiguous
++        }
++        {
++          using NS1::NNS1::inhibited;
++          int x = inhibited(NS1::S1{}); // no error
++
++          using NS1::inhibited;
++          NS1::S1 y = inhibited(NS1::S1{}); // error: call to 'inhibited' is ambiguous
++        }
++        {
++          using namespace NS2;
++          inhibited(NS1::S1{}); // no error
++
++          using namespace NS1::NNS1;
++          inhibited(NS1::S1{}); // error: call to 'inhibited' is ambiguous
++        }
++        {
++          using NS2::inhibited;
++          inhibited(NS1::S1{}); // no error
++
++          using NS1::NNS1::inhibited;
++          inhibited(NS1::S1{}); // error: call to 'inhibited' is ambiguous
++        }
++      }
++  }];
 +}
 diff --git a/clang/include/clang/Basic/DiagnosticSemaKinds.td b/clang/include/clang/Basic/DiagnosticSemaKinds.td
-index 04bba621e241..6e66d4564dfc 100644
+index 18a0154b0041..186432cb95dc 100644
 --- a/clang/include/clang/Basic/DiagnosticSemaKinds.td
 +++ b/clang/include/clang/Basic/DiagnosticSemaKinds.td
-@@ -3163,6 +3163,9 @@ def err_attribute_invalid_size : Error<
+@@ -3165,6 +3165,9 @@ def err_attribute_invalid_size : Error<
    "vector size not an integral multiple of component size">;
  def err_attribute_zero_size : Error<"zero %0 size">;
  def err_attribute_size_too_large : Error<"%0 size too large">;
 +def err_disable_adl_no_operators : Error<
-+  "can't apply '__disable_adl' to %select{operators|member functions}0, since "
-+  "they%select{'re supposed to be used| don't interact}0 with ADL">;
++  "can't apply '__disable_adl' to %select{operators, since they're supposed to "
++  "be used with ADL|member functions}0">;
  def err_typecheck_sve_ambiguous : Error<
    "cannot combine fixed-length and sizeless SVE vectors in expression, result is ambiguous (%0 and %1)">;
  def err_typecheck_sve_rvv_gnu_ambiguous : Error<
 diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
-index ab7f7c2b4b34..b0e5d455b05b 100644
+index f17a6028a137..f5612087d7e2 100644
 --- a/clang/include/clang/Basic/TokenKinds.def
 +++ b/clang/include/clang/Basic/TokenKinds.def
-@@ -747,6 +747,7 @@ ALIAS("__char32_t"   , char32_t          , KEYCXX)
+@@ -746,6 +746,7 @@ ALIAS("__char32_t"   , char32_t          , KEYCXX)
  KEYWORD(__builtin_bit_cast               , KEYALL)
  KEYWORD(__builtin_available              , KEYALL)
  KEYWORD(__builtin_sycl_unique_stable_name, KEYSYCL)
@@ -184,10 +173,10 @@ index ab7f7c2b4b34..b0e5d455b05b 100644
  // Clang-specific keywords enabled only in testing.
  TESTING_KEYWORD(__unknown_anytype , KEYALL)
 diff --git a/clang/lib/Parse/ParseDecl.cpp b/clang/lib/Parse/ParseDecl.cpp
-index 2b5829ba0ef0..7f87a9bd1e79 100644
+index 18897188828f..6fd88c3942f1 100644
 --- a/clang/lib/Parse/ParseDecl.cpp
 +++ b/clang/lib/Parse/ParseDecl.cpp
-@@ -3832,6 +3832,15 @@ void Parser::ParseDeclarationSpecifiers(
+@@ -3829,6 +3829,15 @@ void Parser::ParseDeclarationSpecifiers(
        ParseAttributes(PAKM_GNU | PAKM_Declspec, DS.getAttributes(), LateAttrs);
        continue;
  
@@ -196,7 +185,7 @@ index 2b5829ba0ef0..7f87a9bd1e79 100644
 +      SourceLocation AttrNameLoc = Tok.getLocation();
 +      DS.getAttributes().addNew(
 +          AttrName, AttrNameLoc, /*scopeName=*/nullptr, AttrNameLoc,
-+          /*args=*/nullptr, /*NumArgs=*/0, ParsedAttr::AS_Keyword);
++          /*args=*/nullptr, /*NumArgs=*/0, tok::kw___disable_adl);
 +      break;
 +    }
 +
@@ -204,10 +193,19 @@ index 2b5829ba0ef0..7f87a9bd1e79 100644
      case tok::kw___forceinline: {
        isInvalid = DS.setFunctionSpecForceInline(Loc, PrevSpec, DiagID);
 diff --git a/clang/lib/Sema/SemaDeclAttr.cpp b/clang/lib/Sema/SemaDeclAttr.cpp
-index 229e73618c53..6c6926f83d37 100644
+index 27cfde2ed216..e796544fd436 100644
 --- a/clang/lib/Sema/SemaDeclAttr.cpp
 +++ b/clang/lib/Sema/SemaDeclAttr.cpp
-@@ -5754,6 +5754,16 @@ static void handleBuiltinAliasAttr(Sema &S, Decl *D,
+@@ -3834,7 +3834,7 @@ static void handleInitPriorityAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+     S.Diag(AL.getLoc(), diag::warn_attribute_ignored) << AL;
+     return;
+   }
+-  
++
+   if (S.getLangOpts().HLSL) {
+     S.Diag(AL.getLoc(), diag::err_hlsl_init_priority_unsupported);
+     return;
+@@ -5757,6 +5757,16 @@ static void handleBuiltinAliasAttr(Sema &S, Decl *D,
    D->addAttr(::new (S.Context) BuiltinAliasAttr(S.Context, AL, Ident));
  }
  
@@ -224,7 +222,7 @@ index 229e73618c53..6c6926f83d37 100644
  //===----------------------------------------------------------------------===//
  // Checker-specific attribute handlers.
  //===----------------------------------------------------------------------===//
-@@ -9359,6 +9369,10 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
+@@ -9363,6 +9373,10 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
    case ParsedAttr::AT_UsingIfExists:
      handleSimpleAttribute<UsingIfExistsAttr>(S, D, AL);
      break;
@@ -236,7 +234,7 @@ index 229e73618c53..6c6926f83d37 100644
  }
  
 diff --git a/clang/lib/Sema/SemaLookup.cpp b/clang/lib/Sema/SemaLookup.cpp
-index 09a38571762d..bbba0ba83f48 100644
+index 1fda7269b645..f176d8ac783c 100644
 --- a/clang/lib/Sema/SemaLookup.cpp
 +++ b/clang/lib/Sema/SemaLookup.cpp
 @@ -3867,6 +3867,9 @@ void Sema::ArgumentDependentLookup(DeclarationName Name, SourceLocation Loc,
@@ -250,10 +248,10 @@ index 09a38571762d..bbba0ba83f48 100644
        // it's ordinarily visible or declared as a friend in an associated
        // class.
 diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
-index a138e1bc8b7d..b7a806448821 100644
+index 5a8544e3739f..d1f2565506a0 100644
 --- a/clang/lib/Sema/SemaOverload.cpp
 +++ b/clang/lib/Sema/SemaOverload.cpp
-@@ -6521,7 +6521,7 @@ void Sema::AddOverloadCandidate(
+@@ -6528,7 +6528,7 @@ void Sema::AddOverloadCandidate(
        NamedDecl *ND = Function;
        if (auto *SpecInfo = Function->getTemplateSpecializationInfo())
          ND = SpecInfo->getTemplate();
@@ -262,7 +260,7 @@ index a138e1bc8b7d..b7a806448821 100644
        if (ND->getFormalLinkage() == Linkage::InternalLinkage) {
          Candidate.Viable = false;
          Candidate.FailureKind = ovl_fail_module_mismatched;
-@@ -12925,18 +12925,20 @@ bool Sema::ResolveAndFixSingleFunctionTemplateSpecialization(
+@@ -12933,18 +12933,20 @@ bool Sema::ResolveAndFixSingleFunctionTemplateSpecialization(
  }
  
  /// Add a single candidate to the overload set.
@@ -290,7 +288,7 @@ index a138e1bc8b7d..b7a806448821 100644
      if (ExplicitTemplateArgs) {
        assert(!KnownValid && "Explicit template arguments?");
        return;
-@@ -12953,6 +12955,10 @@ static void AddOverloadedCallCandidate(Sema &S,
+@@ -12961,6 +12963,10 @@ static void AddOverloadedCallCandidate(Sema &S,
  
    if (FunctionTemplateDecl *FuncTemplate
        = dyn_cast<FunctionTemplateDecl>(Callee)) {
@@ -301,7 +299,7 @@ index a138e1bc8b7d..b7a806448821 100644
      S.AddTemplateOverloadCandidate(FuncTemplate, FoundDecl,
                                     ExplicitTemplateArgs, Args, CandidateSet,
                                     /*SuppressUserConversions=*/false,
-@@ -13011,7 +13017,7 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
+@@ -13019,7 +13025,7 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
           E = ULE->decls_end(); I != E; ++I)
      AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
                                 CandidateSet, PartialOverloading,
@@ -310,7 +308,7 @@ index a138e1bc8b7d..b7a806448821 100644
  
    if (ULE->requiresADL())
      AddArgumentDependentLookupCandidates(ULE->getName(), ULE->getExprLoc(),
-@@ -13026,7 +13032,8 @@ void Sema::AddOverloadedCallCandidates(
+@@ -13034,7 +13040,8 @@ void Sema::AddOverloadedCallCandidates(
      ArrayRef<Expr *> Args, OverloadCandidateSet &CandidateSet) {
    for (LookupResult::iterator I = R.begin(), E = R.end(); I != E; ++I)
      AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
@@ -320,20 +318,9 @@ index a138e1bc8b7d..b7a806448821 100644
  }
  
  /// Determine whether a declaration with the specified name could be moved into
-@@ -13972,8 +13979,8 @@ Sema::CreateOverloadedBinOp(SourceLocation OpLoc, BinaryOperatorKind Opc,
-               Diag(FnDecl->getLocation(),
-                    diag::note_ovl_ambiguous_oper_binary_reversed_self);
-               // Mark member== const or provide matching != to disallow reversed
--              // args. Eg. 
--              // struct S { bool operator==(const S&); }; 
-+              // args. Eg.
-+              // struct S { bool operator==(const S&); };
-               // S()==S();
-               if (auto *MD = dyn_cast<CXXMethodDecl>(FnDecl))
-                 if (Op == OverloadedOperatorKind::OO_EqualEqual &&
 diff --git a/clang/test/SemaCXX/disable-adl.cpp b/clang/test/SemaCXX/disable-adl.cpp
 new file mode 100644
-index 000000000000..fb10e39ee338
+index 000000000000..ce30f6350f60
 --- /dev/null
 +++ b/clang/test/SemaCXX/disable-adl.cpp
 @@ -0,0 +1,179 @@
@@ -495,8 +482,8 @@ index 000000000000..fb10e39ee338
 +}
 +
 +struct S {
-+  __disable_adl void f();        // expected-error{{can't apply '__disable_adl' to member functions, since they don't interact with ADL}}
-+  __disable_adl static void g(); // expected-error{{can't apply '__disable_adl' to member functions, since they don't interact with ADL}}
++  __disable_adl void f();        // expected-error{{can't apply '__disable_adl' to member functions}}
++  __disable_adl static void g(); // expected-error{{can't apply '__disable_adl' to member functions}}
 +};
 +
 +template <class> using common_comparison_category_t = int;
@@ -517,5 +504,5 @@ index 000000000000..fb10e39ee338
 +  requires { p1 > p2; }; // expected-warning 2 {{expression result unused}}
 +}
 -- 
-2.40.0.348.gf938b09366-goog
+2.40.0.634.g4ca3ef3211-goog
 
