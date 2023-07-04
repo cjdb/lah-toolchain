@@ -22,9 +22,6 @@ jobs:
           - name: X86
             triple: x86_64-unknown-linux-gnu
             gcc-triple:
-          - name: ARM
-            triple: armv7a-unknown-linux-gnueabi
-            gcc-triple: -arm-linux-gnueabi
           - name: AArch64
             triple: aarch64-unknown-linux-gnu
             gcc-triple: -aarch64-linux-gnu
