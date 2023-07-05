@@ -97,6 +97,7 @@ jobs:
             -DCMAKE_CROSSCOMPILING=Yes
             -DCMAKE_INSTALL_PREFIX=/tmp/llvm
             -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.target.triple }}
+            -DLLVM_ENABLE_ASSERTIONS=Yes
             -DLLVM_ENABLE_LLD=Yes
             -DLLVM_ENABLE_LIBCXX=Yes
             -DLLVM_ENABLE_MODULES=No
