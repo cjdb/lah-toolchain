@@ -1,7 +1,7 @@
 name: toolchain-release
 on:
   schedule:
-    - cron: '23 18 * * 6'
+    - cron: '23 18 * * *'
   push:
   pull_request:
 
@@ -104,6 +104,8 @@ jobs:
             -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;polly'
             -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind'
             -DLLVM_ENABLE_ZLIB=Yes
+            -DLLVM_INSTALL_UTILS=Yes
+            -DLLVM_OPTIMIZED_TABLEGEN=Yes
             -DLLVM_TARGETS_TO_BUILD=${{ matrix.target.name }}
 
       - name: Build and install llvm-project
