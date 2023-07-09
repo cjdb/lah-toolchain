@@ -10,8 +10,8 @@ jobs:
     name: Build LLVM
     runs-on: ${{ matrix.os }}
     env:
-      CC: /tmp/llvm/bin/clang
-      CXX: /tmp/llvm/bin/clang++
+      CC: /usr/bin/clang
+      CXX: /usr/bin/clang++
       artifact-path: llvm-${{ matrix.target.triple }}.tar.xz
       LD_LIBRARY_PATH: "/tmp/llvm/lib:/tmp/llvm/lib/${{ matrix.toolchain }}:/usr/lib"
     strategy:
