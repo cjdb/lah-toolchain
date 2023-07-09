@@ -29,38 +29,28 @@ jobs:
       - name: Install tools
         id: install_tools
         run: |
+          sudo wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|sudo apt-key add -
+          sudo apt-add-repository 'deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy main'
           sudo apt-get update
           sudo apt-get autoremove -y
           sudo apt-get remove -y clang-* llvm-*
           sudo apt-get install -y                   \
             binutils${{ matrix.target.gcc-triple }} \
             bzip2                                   \
+            cmake                                   \
             gcc-11${{ matrix.target.gcc-triple }}   \
             g++-11${{ matrix.target.gcc-triple }}   \
             libedit-dev                             \
             libz3-dev                               \
+            clang                                   \
+            clang-tools                             \
+            libc++-17-dev                           \
+            libc++abi-17-dev                        \
+            lld                                     \
+            llvm-dev                                \
             lua5.3                                  \
             ninja-build                             \
-            python3                                 \
-            python3-pip                             \
             swig4.0
-          sudo python3 -m pip install pip --upgrade
-          sudo python3 -m pip install cmake
-
-      - name: Download and extract LLVM toolchain
-        working-directory: /tmp
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          REPO="cjdb/lah-toolchain"
-          WF_NAME="toolchain-release"
-          ARTIFACT_NAME="llvm-x86_64-unknown-linux-gnu.tar.xz"
-          for i in $(seq 1 100); do
-            RUN_ID=`gh run --repo ${REPO} list --workflow ${WF_NAME} --json databaseId --jq .[$i].databaseId` || exit 1
-            gh run --repo ${REPO} download ${RUN_ID} -n ${ARTIFACT_NAME} || continue
-            break
-          done
-          tar -xvf ${ARTIFACT_NAME}
 
       - name: Checkout lah-toolchain
         uses: actions/checkout@v3
@@ -100,7 +90,7 @@ jobs:
             -DLLVM_ENABLE_ASSERTIONS=Yes
             -DLLVM_ENABLE_LLD=Yes
             -DLLVM_ENABLE_LIBCXX=Yes
-            -DLLVM_ENABLE_MODULES=No
+            -DLLVM_ENABLE_MODULES=Yes
             -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;polly'
             -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind'
             -DLLVM_ENABLE_ZLIB=Yes
