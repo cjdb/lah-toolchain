@@ -12,12 +12,17 @@ jobs:
     env:
       CC: /usr/bin/clang
       CXX: /usr/bin/clang++
-      artifact-path: llvm-${{ matrix.target.triple }}.tar.xz
+      artifact-path: llvm--${{ matrix.target.triple }}-${{ matrix.stdlib.name }}.tar.xz
       LD_LIBRARY_PATH: "/tmp/llvm/lib:/tmp/llvm/lib/${{ matrix.toolchain }}:/usr/lib"
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
+        stdlib:
+          - name: libcxx
+            value: Yes
+          - name: libstdcxx
+            value: No
         target:
           - name: X86
             triple: x86_64-unknown-linux-gnu
@@ -89,8 +94,8 @@ jobs:
             -DLLVM_DEFAULT_TARGET_TRIPLE=${{ matrix.target.triple }}
             -DLLVM_ENABLE_ASSERTIONS=Yes
             -DLLVM_ENABLE_LLD=Yes
-            -DLLVM_ENABLE_LIBCXX=Yes
-            -DLLVM_ENABLE_MODULES=Yes
+            -DLLVM_ENABLE_LIBCXX=${{ matrix.stdlib.value }}
+            -DLLVM_ENABLE_MODULES=${{ matrix.stdlib.value }}
             -DLLVM_ENABLE_PROJECTS='clang;clang-tools-extra;lld;polly'
             -DLLVM_ENABLE_RUNTIMES='compiler-rt;libcxx;libcxxabi;libunwind'
             -DLLVM_ENABLE_ZLIB=Yes
