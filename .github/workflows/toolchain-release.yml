@@ -49,8 +49,8 @@ jobs:
             libz3-dev                               \
             clang                                   \
             clang-tools                             \
-            libc++-17-dev                           \
-            libc++abi-17-dev                        \
+            libc++-18-dev                           \
+            libc++abi-18-dev                        \
             lld                                     \
             llvm-dev                                \
             lua5.3                                  \
