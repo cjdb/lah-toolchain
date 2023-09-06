@@ -1,4 +1,4 @@
-From c000f9f3895f678132b6e1a082e6de07dd90aebd Mon Sep 17 00:00:00 2001
+From c56326f0a418b7b660ca97baf8a9550184730aaa Mon Sep 17 00:00:00 2001
 From: Christopher Di Bella <cjdb.ns@gmail.com>
 Date: Sat, 22 Oct 2022 22:54:38 -0700
 Subject: [PATCH 1/3] adds `__reference_constructs_from_temporary`
@@ -10,7 +10,7 @@ functionality.
 Differential Revision: https://reviews.llvm.org/D135341
 ---
  clang/docs/LanguageExtensions.rst             |   1 +
- .../clang/Basic/DiagnosticCommonKinds.td      |   3 +
+ .../clang/Basic/DiagnosticCommonKinds.td      |   2 +
  clang/include/clang/Basic/TokenKinds.def      |   2 +
  clang/lib/Lex/PPMacroExpansion.cpp            |   2 +
  clang/lib/Parse/ParseDeclCXX.cpp              |   5 +-
@@ -18,13 +18,13 @@ Differential Revision: https://reviews.llvm.org/D135341
  clang/lib/Sema/SemaExprCXX.cpp                |  28 ++-
  clang/test/SemaCXX/type-traits.cpp            |  49 +++++
  clang/www/cxx_status.html                     | 191 ++++++++++++++++++
- 9 files changed, 278 insertions(+), 6 deletions(-)
+ 9 files changed, 277 insertions(+), 6 deletions(-)
 
 diff --git a/clang/docs/LanguageExtensions.rst b/clang/docs/LanguageExtensions.rst
-index 1830480b1285..d9871b2da5ff 100644
+index 3d2e8aae4421..c4cce1477460 100644
 --- a/clang/docs/LanguageExtensions.rst
 +++ b/clang/docs/LanguageExtensions.rst
-@@ -1616,6 +1616,7 @@ The following type trait primitives are supported by Clang. Those traits marked
+@@ -1621,6 +1621,7 @@ The following type trait primitives are supported by Clang. Those traits marked
    materialized temporary object. If ``T`` is not a reference type the result
    is false. Note this trait will also return false when the initialization of
    ``T`` from ``U`` is ill-formed.
@@ -33,19 +33,18 @@ index 1830480b1285..d9871b2da5ff 100644
  
  In addition, the following expression traits are supported:
 diff --git a/clang/include/clang/Basic/DiagnosticCommonKinds.td b/clang/include/clang/Basic/DiagnosticCommonKinds.td
-index ee994e765e09..0e0d27795266 100644
+index f2df283c7482..d74473d78be3 100644
 --- a/clang/include/clang/Basic/DiagnosticCommonKinds.td
 +++ b/clang/include/clang/Basic/DiagnosticCommonKinds.td
-@@ -421,4 +421,7 @@ def err_opencl_extension_and_feature_differs : Error<
-   "options %0 and %1 are set to different values">;
- def err_opencl_feature_requires : Error<
-   "feature %0 requires support of %1 feature">;
-+
+@@ -434,4 +434,6 @@ def warn_try_not_valid_on_target : Warning<
+   "target '%0' does not support exception handling;"
+   " 'catch' block is ignored">,
+   InGroup<OpenMPTargetException>;
 +def err_reserved_identifier_for_future_use : Error<
 +  "%0 is a compiler-reserved identifier for a future feature">;
  }
 diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
-index ef0dad0f2dcd..c5a23949430a 100644
+index 45ebc200b168..e998b77e0264 100644
 --- a/clang/include/clang/Basic/TokenKinds.def
 +++ b/clang/include/clang/Basic/TokenKinds.def
 @@ -531,6 +531,8 @@ TYPE_TRAIT_1(__is_scoped_enum, IsScopedEnum, KEYCXX)
@@ -58,7 +57,7 @@ index ef0dad0f2dcd..c5a23949430a 100644
  // Embarcadero Expression Traits
  EXPRESSION_TRAIT(__is_lvalue_expr, IsLValueExpr, KEYCXX)
 diff --git a/clang/lib/Lex/PPMacroExpansion.cpp b/clang/lib/Lex/PPMacroExpansion.cpp
-index 71d38e59707a..b55f0b1d2b74 100644
+index 775cbfafa999..bea775a51506 100644
 --- a/clang/lib/Lex/PPMacroExpansion.cpp
 +++ b/clang/lib/Lex/PPMacroExpansion.cpp
 @@ -1695,6 +1695,8 @@ void Preprocessor::ExpandBuiltinMacro(Token &Tok) {
@@ -71,10 +70,10 @@ index 71d38e59707a..b55f0b1d2b74 100644
  #include "clang/Basic/TransformTypeTraits.def"
                .Default(false);
 diff --git a/clang/lib/Parse/ParseDeclCXX.cpp b/clang/lib/Parse/ParseDeclCXX.cpp
-index c1e09db2b3ee..abb5991cbac7 100644
+index 730b6e55246d..a783d75f2821 100644
 --- a/clang/lib/Parse/ParseDeclCXX.cpp
 +++ b/clang/lib/Parse/ParseDeclCXX.cpp
-@@ -1641,7 +1641,10 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
+@@ -1655,7 +1655,10 @@ void Parser::ParseClassSpecifier(tok::TokenKind TagTokKind,
            tok::kw___is_union,
            tok::kw___is_unsigned,
            tok::kw___is_void,
@@ -87,10 +86,10 @@ index c1e09db2b3ee..abb5991cbac7 100644
      // name of struct templates, but some are keywords in GCC >= 4.3
      // and Clang. Therefore, when we see the token sequence "struct
 diff --git a/clang/lib/Parse/ParseExpr.cpp b/clang/lib/Parse/ParseExpr.cpp
-index 75d04824d8b9..8ed8071f6bd9 100644
+index f8bf785da289..1767eddc8170 100644
 --- a/clang/lib/Parse/ParseExpr.cpp
 +++ b/clang/lib/Parse/ParseExpr.cpp
-@@ -1127,6 +1127,9 @@ ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
+@@ -1128,6 +1128,9 @@ ExprResult Parser::ParseCastExpression(CastParseKind ParseKind,
            REVERTIBLE_TYPE_TRAIT(__is_unsigned);
            REVERTIBLE_TYPE_TRAIT(__is_void);
            REVERTIBLE_TYPE_TRAIT(__is_volatile);
@@ -101,10 +100,10 @@ index 75d04824d8b9..8ed8071f6bd9 100644
    REVERTIBLE_TYPE_TRAIT(RTT_JOIN(__, Trait));
  #include "clang/Basic/TransformTypeTraits.def"
 diff --git a/clang/lib/Sema/SemaExprCXX.cpp b/clang/lib/Sema/SemaExprCXX.cpp
-index 423d5372a6f6..41d488b34293 100644
+index a7be01319a72..7c88a97ddb24 100644
 --- a/clang/lib/Sema/SemaExprCXX.cpp
 +++ b/clang/lib/Sema/SemaExprCXX.cpp
-@@ -29,6 +29,7 @@
+@@ -30,6 +30,7 @@
  #include "clang/Basic/TargetInfo.h"
  #include "clang/Basic/TokenKinds.h"
  #include "clang/Basic/TypeTraits.h"
@@ -112,7 +111,7 @@ index 423d5372a6f6..41d488b34293 100644
  #include "clang/Lex/Preprocessor.h"
  #include "clang/Sema/DeclSpec.h"
  #include "clang/Sema/EnterExpressionEvaluationContext.h"
-@@ -5409,14 +5410,15 @@ static bool EvaluateBooleanTypeTrait(Sema &S, TypeTrait Kind,
+@@ -5410,14 +5411,15 @@ static bool EvaluateBooleanTypeTrait(Sema &S, TypeTrait Kind,
    if (Kind <= UTT_Last)
      return EvaluateUnaryTypeTrait(S, Kind, KWLoc, Args[0]->getType());
  
@@ -131,7 +130,7 @@ index 423d5372a6f6..41d488b34293 100644
    case clang::TT_IsConstructible:
    case clang::TT_IsNothrowConstructible:
    case clang::TT_IsTriviallyConstructible: {
-@@ -5493,11 +5495,23 @@ static bool EvaluateBooleanTypeTrait(Sema &S, TypeTrait Kind,
+@@ -5494,11 +5496,23 @@ static bool EvaluateBooleanTypeTrait(Sema &S, TypeTrait Kind,
      if (Kind == clang::TT_IsConstructible)
        return true;
  
@@ -157,7 +156,7 @@ index 423d5372a6f6..41d488b34293 100644
      }
  
      if (Kind == clang::TT_IsNothrowConstructible)
-@@ -5695,6 +5709,10 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
+@@ -5696,6 +5710,10 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
      QualType Rhs = Self.getASTContext().getUnqualifiedArrayType(RhsT, RhsQuals);
      return Self.Context.typesAreCompatible(Lhs, Rhs);
    }
@@ -229,10 +228,10 @@ index 0fb364eaf362..de86b6ed3841 100644
    int t01[T(__array_rank(IntAr) == 1)];
    int t02[T(__array_rank(ConstIntArAr) == 2)];
 diff --git a/clang/www/cxx_status.html b/clang/www/cxx_status.html
-index 23dc53b5a3cb..fb9e94dfaa18 100755
+index da0a1c219c0e..e426232e914a 100755
 --- a/clang/www/cxx_status.html
 +++ b/clang/www/cxx_status.html
-@@ -1096,6 +1096,197 @@ You can use Clang in C++17 mode with the <code>-std=c++17</code> option
+@@ -1091,6 +1091,197 @@ You can use Clang in C++17 mode with the <code>-std=c++17</code> option
        <td><a href="https://wg21.link/p0195r2">P0195R2</a></td>
        <td class="full" align="center">Clang 4</td>
      </tr>
@@ -431,5 +430,5 @@ index 23dc53b5a3cb..fb9e94dfaa18 100755
  
  <p>
 -- 
-2.41.0
+2.42.0
 

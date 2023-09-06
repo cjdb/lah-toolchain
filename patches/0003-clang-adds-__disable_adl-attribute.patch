@@ -1,4 +1,4 @@
-From eddb420a2c9136c78fe6f81f18c2cdd51ed2221b Mon Sep 17 00:00:00 2001
+From 8a58d92e5917e502d1004af414ad6d90957486f9 Mon Sep 17 00:00:00 2001
 From: Christopher Di Bella <cjdb.ns@gmail.com>
 Date: Fri, 2 Jun 2023 21:00:01 -0700
 Subject: [PATCH 3/3] [clang] adds `__disable_adl` attribute
@@ -22,7 +22,7 @@ This commit has seen compile times halved when the `__disable_adl`
 attribute is applied instead of opting to use a function object.
 ---
  clang/include/clang/AST/ExprCXX.h             |   3 +
- clang/include/clang/Basic/Attr.td             |   8 +-
+ clang/include/clang/Basic/Attr.td             |   7 +
  clang/include/clang/Basic/AttrDocs.td         |  66 +++++++
  .../clang/Basic/DiagnosticSemaKinds.td        |   3 +
  clang/include/clang/Basic/TokenKinds.def      |   1 +
@@ -31,14 +31,14 @@ attribute is applied instead of opting to use a function object.
  clang/lib/Sema/SemaLookup.cpp                 |   3 +
  clang/lib/Sema/SemaOverload.cpp               |  25 ++-
  clang/test/SemaCXX/disable-adl.cpp            | 179 ++++++++++++++++++
- 10 files changed, 301 insertions(+), 10 deletions(-)
+ 10 files changed, 301 insertions(+), 9 deletions(-)
  create mode 100644 clang/test/SemaCXX/disable-adl.cpp
 
 diff --git a/clang/include/clang/AST/ExprCXX.h b/clang/include/clang/AST/ExprCXX.h
-index f5e805257ce5..156073366781 100644
+index 17dbb5e888eb..3d3408e9ee97 100644
 --- a/clang/include/clang/AST/ExprCXX.h
 +++ b/clang/include/clang/AST/ExprCXX.h
-@@ -3222,6 +3222,9 @@ public:
+@@ -3227,6 +3227,9 @@ public:
    /// argument-dependent lookup.
    bool requiresADL() const { return UnresolvedLookupExprBits.RequiresADL; }
  
@@ -49,10 +49,10 @@ index f5e805257ce5..156073366781 100644
    bool isOverloaded() const { return UnresolvedLookupExprBits.Overloaded; }
  
 diff --git a/clang/include/clang/Basic/Attr.td b/clang/include/clang/Basic/Attr.td
-index d5204b286966..b175cee95cf9 100644
+index 4f281c5c8bde..1f7fcadb483a 100644
 --- a/clang/include/clang/Basic/Attr.td
 +++ b/clang/include/clang/Basic/Attr.td
-@@ -4193,9 +4193,15 @@ def ReadOnlyPlacement : InheritableAttr {
+@@ -4217,6 +4217,13 @@ def ReadOnlyPlacement : InheritableAttr {
    let Documentation = [ReadOnlyPlacementDocs];
  }
  
@@ -66,14 +66,11 @@ index d5204b286966..b175cee95cf9 100644
  def AvailableOnlyInDefaultEvalMethod : InheritableAttr {
    let Spellings = [Clang<"available_only_in_default_eval_method">];
    let Subjects = SubjectList<[TypedefName], ErrorDiag>;
-   let Documentation = [Undocumented];
- }
--
 diff --git a/clang/include/clang/Basic/AttrDocs.td b/clang/include/clang/Basic/AttrDocs.td
-index cd1d298b0a8f..b0275735057b 100644
+index f11ea89d14ba..1d995b35867e 100644
 --- a/clang/include/clang/Basic/AttrDocs.td
 +++ b/clang/include/clang/Basic/AttrDocs.td
-@@ -7054,6 +7054,72 @@ its underlying representation to be a WebAssembly ``funcref``.
+@@ -7167,6 +7167,72 @@ its underlying representation to be a WebAssembly ``funcref``.
    }];
  }
  
@@ -147,10 +144,10 @@ index cd1d298b0a8f..b0275735057b 100644
    let Category = DocCatType;
    let Content = [{
 diff --git a/clang/include/clang/Basic/DiagnosticSemaKinds.td b/clang/include/clang/Basic/DiagnosticSemaKinds.td
-index 415d211b3965..58a78b649407 100644
+index 2a72793e8109..fa517888a3f0 100644
 --- a/clang/include/clang/Basic/DiagnosticSemaKinds.td
 +++ b/clang/include/clang/Basic/DiagnosticSemaKinds.td
-@@ -3217,6 +3217,9 @@ def err_attribute_invalid_size : Error<
+@@ -3234,6 +3234,9 @@ def err_attribute_invalid_size : Error<
    "vector size not an integral multiple of component size">;
  def err_attribute_zero_size : Error<"zero %0 size">;
  def err_attribute_size_too_large : Error<"%0 size too large">;
@@ -161,7 +158,7 @@ index 415d211b3965..58a78b649407 100644
    "cannot combine fixed-length and sizeless %select{SVE|RVV}0 vectors "
    "in expression, result is ambiguous (%1 and %2)">;
 diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
-index c5a23949430a..e7bd80a5753d 100644
+index e998b77e0264..d8244657b04c 100644
 --- a/clang/include/clang/Basic/TokenKinds.def
 +++ b/clang/include/clang/Basic/TokenKinds.def
 @@ -752,6 +752,7 @@ ALIAS("__char32_t"   , char32_t          , KEYCXX)
@@ -173,10 +170,10 @@ index c5a23949430a..e7bd80a5753d 100644
  // Keywords defined by Attr.td.
  #ifndef KEYWORD_ATTRIBUTE
 diff --git a/clang/lib/Parse/ParseDecl.cpp b/clang/lib/Parse/ParseDecl.cpp
-index 43b2a32cce71..ad78b01b1258 100644
+index 4a9f2caf6547..205c445833d1 100644
 --- a/clang/lib/Parse/ParseDecl.cpp
 +++ b/clang/lib/Parse/ParseDecl.cpp
-@@ -3871,6 +3871,15 @@ void Parser::ParseDeclarationSpecifiers(
+@@ -3948,6 +3948,15 @@ void Parser::ParseDeclarationSpecifiers(
        ParseAttributes(PAKM_GNU | PAKM_Declspec, DS.getAttributes(), LateAttrs);
        continue;
  
@@ -193,10 +190,10 @@ index 43b2a32cce71..ad78b01b1258 100644
      case tok::kw___forceinline: {
        isInvalid = DS.setFunctionSpecForceInline(Loc, PrevSpec, DiagID);
 diff --git a/clang/lib/Sema/SemaDeclAttr.cpp b/clang/lib/Sema/SemaDeclAttr.cpp
-index 429fa12ff2e2..da32e3b10b98 100644
+index 59e0f3e83cfd..1708a27fd7d3 100644
 --- a/clang/lib/Sema/SemaDeclAttr.cpp
 +++ b/clang/lib/Sema/SemaDeclAttr.cpp
-@@ -5869,6 +5869,16 @@ static void handleBuiltinAliasAttr(Sema &S, Decl *D,
+@@ -5881,6 +5881,16 @@ static void handleBuiltinAliasAttr(Sema &S, Decl *D,
    D->addAttr(::new (S.Context) BuiltinAliasAttr(S.Context, AL, Ident));
  }
  
@@ -213,7 +210,7 @@ index 429fa12ff2e2..da32e3b10b98 100644
  //===----------------------------------------------------------------------===//
  // Checker-specific attribute handlers.
  //===----------------------------------------------------------------------===//
-@@ -9512,6 +9522,10 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
+@@ -9506,6 +9516,10 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
    case ParsedAttr::AT_UsingIfExists:
      handleSimpleAttribute<UsingIfExistsAttr>(S, D, AL);
      break;
@@ -225,10 +222,10 @@ index 429fa12ff2e2..da32e3b10b98 100644
  }
  
 diff --git a/clang/lib/Sema/SemaLookup.cpp b/clang/lib/Sema/SemaLookup.cpp
-index c4f4edb6666c..3d9432cdeb54 100644
+index 7dd96e3155e1..db63d606a220 100644
 --- a/clang/lib/Sema/SemaLookup.cpp
 +++ b/clang/lib/Sema/SemaLookup.cpp
-@@ -3871,6 +3871,9 @@ void Sema::ArgumentDependentLookup(DeclarationName Name, SourceLocation Loc,
+@@ -3890,6 +3890,9 @@ void Sema::ArgumentDependentLookup(DeclarationName Name, SourceLocation Loc,
            !isa<FunctionTemplateDecl>(Underlying))
          continue;
  
@@ -239,10 +236,10 @@ index c4f4edb6666c..3d9432cdeb54 100644
        // it's ordinarily visible or declared as a friend in an associated
        // class.
 diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
-index 7b4e98ead823..15b15b50b9f8 100644
+index 0f026cab568e..15e1f48776d2 100644
 --- a/clang/lib/Sema/SemaOverload.cpp
 +++ b/clang/lib/Sema/SemaOverload.cpp
-@@ -13009,18 +13009,20 @@ bool Sema::ResolveAndFixSingleFunctionTemplateSpecialization(
+@@ -13065,18 +13065,20 @@ bool Sema::ResolveAndFixSingleFunctionTemplateSpecialization(
  }
  
  /// Add a single candidate to the overload set.
@@ -270,7 +267,7 @@ index 7b4e98ead823..15b15b50b9f8 100644
      if (ExplicitTemplateArgs) {
        assert(!KnownValid && "Explicit template arguments?");
        return;
-@@ -13037,6 +13039,10 @@ static void AddOverloadedCallCandidate(Sema &S,
+@@ -13093,6 +13095,10 @@ static void AddOverloadedCallCandidate(Sema &S,
  
    if (FunctionTemplateDecl *FuncTemplate
        = dyn_cast<FunctionTemplateDecl>(Callee)) {
@@ -281,7 +278,7 @@ index 7b4e98ead823..15b15b50b9f8 100644
      S.AddTemplateOverloadCandidate(FuncTemplate, FoundDecl,
                                     ExplicitTemplateArgs, Args, CandidateSet,
                                     /*SuppressUserConversions=*/false,
-@@ -13095,7 +13101,7 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
+@@ -13151,7 +13157,7 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
           E = ULE->decls_end(); I != E; ++I)
      AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
                                 CandidateSet, PartialOverloading,
@@ -290,7 +287,7 @@ index 7b4e98ead823..15b15b50b9f8 100644
  
    if (ULE->requiresADL())
      AddArgumentDependentLookupCandidates(ULE->getName(), ULE->getExprLoc(),
-@@ -13110,7 +13116,8 @@ void Sema::AddOverloadedCallCandidates(
+@@ -13166,7 +13172,8 @@ void Sema::AddOverloadedCallCandidates(
      ArrayRef<Expr *> Args, OverloadCandidateSet &CandidateSet) {
    for (LookupResult::iterator I = R.begin(), E = R.end(); I != E; ++I)
      AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
@@ -486,5 +483,5 @@ index 000000000000..fb10e39ee338
 +  requires { p1 > p2; }; // expected-warning 2 {{expression result unused}}
 +}
 -- 
-2.41.0
+2.42.0
 
