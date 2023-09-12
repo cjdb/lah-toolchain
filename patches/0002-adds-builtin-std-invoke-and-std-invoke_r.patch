@@ -1,7 +1,7 @@
-From 75d1be38be5442aba2aa5e159ae01e4a9aee3293 Mon Sep 17 00:00:00 2001
+From 575ab43ab0d8bed13d2ebad7f68e5e892070eb98 Mon Sep 17 00:00:00 2001
 From: Christopher Di Bella <cjdb.ns@gmail.com>
 Date: Sun, 23 Oct 2022 00:31:28 -0700
-Subject: [PATCH 2/3] adds builtin `std::invoke` and `std::invoke_r`
+Subject: [PATCH] adds builtin `std::invoke` and `std::invoke_r`
 
 `std::invoke` and `std::invoke_r` are fairly expensive in debug builds,
 and are used extensively by standard ranges. By lifting these functions
@@ -29,18 +29,18 @@ using `std::invoke`.
 Differential Revision: https://reviews.llvm.org/D130867
 ---
  clang/include/clang/Basic/BuiltinHeaders.def  |   1 +
- clang/include/clang/Basic/Builtins.def        |   2 +
+ clang/include/clang/Basic/Builtins.def        |   3 +
  .../clang/Basic/DiagnosticSemaKinds.td        |  27 +
  clang/include/clang/Sema/Sema.h               |  77 +--
- clang/lib/AST/ExprConstant.cpp                |   2 +
- clang/lib/CodeGen/CGBuiltin.cpp               |   2 +
- clang/lib/Sema/SemaChecking.cpp               |   6 +
- clang/lib/Sema/SemaDecl.cpp                   |   3 +
- clang/lib/Sema/SemaExpr.cpp                   | 119 +++--
- clang/lib/Sema/SemaExprCXX.cpp                | 204 ++++++-
- clang/lib/Sema/SemaOverload.cpp               | 126 +++--
- clang/test/SemaCXX/builtin-std-invoke.cpp     | 496 ++++++++++++++++++
- 12 files changed, 921 insertions(+), 144 deletions(-)
+ clang/lib/AST/ExprConstant.cpp                |   3 +
+ clang/lib/CodeGen/CGBuiltin.cpp               |   3 +
+ clang/lib/Sema/SemaChecking.cpp               |   7 +
+ clang/lib/Sema/SemaDecl.cpp                   |   4 +
+ clang/lib/Sema/SemaExpr.cpp                   | 119 ++--
+ clang/lib/Sema/SemaExprCXX.cpp                | 204 +++++-
+ clang/lib/Sema/SemaOverload.cpp               | 126 ++--
+ clang/test/SemaCXX/builtin-std-invoke.cpp     | 600 ++++++++++++++++++
+ 12 files changed, 1030 insertions(+), 144 deletions(-)
  create mode 100644 clang/test/SemaCXX/builtin-std-invoke.cpp
 
 diff --git a/clang/include/clang/Basic/BuiltinHeaders.def b/clang/include/clang/Basic/BuiltinHeaders.def
@@ -56,13 +56,14 @@ index 8e4a2f9bee9a..4ce0a0c660cf 100644
  HEADER(IMMINTRIN_H, "immintrin.h")
  HEADER(INTRIN_H, "intrin.h")
 diff --git a/clang/include/clang/Basic/Builtins.def b/clang/include/clang/Basic/Builtins.def
-index f5374537a024..01cfb54e6e4a 100644
+index 586dcf05170e..47e9a6113856 100644
 --- a/clang/include/clang/Basic/Builtins.def
 +++ b/clang/include/clang/Basic/Builtins.def
-@@ -1605,6 +1605,8 @@ LIBBUILTIN(forward, "v&v&", "zfncThE", UTILITY, CXX_LANG)
+@@ -1610,6 +1610,9 @@ LIBBUILTIN(forward, "v&v&", "zfncThE", UTILITY, CXX_LANG)
  LIBBUILTIN(forward_like, "v&v&", "zfncThE", UTILITY, CXX_LANG)
  LIBBUILTIN(move, "v&v&", "zfncThE", UTILITY, CXX_LANG)
  LIBBUILTIN(move_if_noexcept, "v&v&", "zfncThE", UTILITY, CXX_LANG)
++LIBBUILTIN(__invoke, "v.", "zfTh", FUNCTIONAL, CXX_LANG)
 +LIBBUILTIN(invoke, "v.", "zfTh", FUNCTIONAL, CXX_LANG)
 +LIBBUILTIN(invoke_r, "v.", "zfTh", FUNCTIONAL, CXX_LANG)
  
@@ -107,10 +108,10 @@ index 0ac4df8edb24..2a72793e8109 100644
    "incompatible pointer types passing retainable parameter of type %0"
    "to a CF function expecting %1 type">;
 diff --git a/clang/include/clang/Sema/Sema.h b/clang/include/clang/Sema/Sema.h
-index 5fdca93c66ab..b575f373c1ba 100644
+index 304108df9f8d..750daf7ccd8c 100644
 --- a/clang/include/clang/Sema/Sema.h
 +++ b/clang/include/clang/Sema/Sema.h
-@@ -4266,20 +4266,20 @@ public:
+@@ -4274,20 +4274,20 @@ public:
  
    ExprResult CreateOverloadedUnaryOp(SourceLocation OpLoc,
                                       UnaryOperatorKind Opc,
@@ -139,7 +140,7 @@ index 5fdca93c66ab..b575f373c1ba 100644
    ExprResult BuildSynthesizedThreeWayComparison(SourceLocation OpLoc,
                                                  const UnresolvedSetImpl &Fns,
                                                  Expr *LHS, Expr *RHS,
-@@ -4289,17 +4289,16 @@ public:
+@@ -4297,17 +4297,16 @@ public:
                                                  SourceLocation RLoc, Expr *Base,
                                                  MultiExprArg Args);
  
@@ -167,7 +168,7 @@ index 5fdca93c66ab..b575f373c1ba 100644
  
    ExprResult BuildOverloadedArrowExpr(Scope *S, Expr *Base,
                                        SourceLocation OpLoc,
-@@ -5448,7 +5447,8 @@ public:
+@@ -5461,7 +5460,8 @@ public:
                           bool ObjCPropertyAccess = false,
                           bool AvoidPartialAvailabilityChecks = false,
                           ObjCInterfaceDecl *ClassReciever = nullptr,
@@ -177,7 +178,7 @@ index 5fdca93c66ab..b575f373c1ba 100644
    void NoteDeletedFunction(FunctionDecl *FD);
    void NoteDeletedInheritingConstructor(CXXConstructorDecl *CD);
    bool DiagnosePropertyAccessorMismatch(ObjCPropertyDecl *PD,
-@@ -5777,11 +5777,11 @@ public:
+@@ -5790,11 +5790,11 @@ public:
  
    // Binary/Unary Operators.  'Tok' is the token for the operator.
    ExprResult CreateBuiltinUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
@@ -193,7 +194,7 @@ index 5fdca93c66ab..b575f373c1ba 100644
  
    bool isQualifiedMemberAccess(Expr *E);
    QualType CheckAddressOfOperand(ExprResult &Operand, SourceLocation OpLoc);
-@@ -5932,16 +5932,18 @@ public:
+@@ -5945,16 +5945,18 @@ public:
                    const TemplateArgumentListInfo *TemplateArgs = nullptr);
  
    void ActOnDefaultCtorInitializers(Decl *CDtorDecl);
@@ -217,7 +218,7 @@ index 5fdca93c66ab..b575f373c1ba 100644
    /// ActOnCallExpr - Handle a call to Fn with the specified array of arguments.
    /// This provides the location of the left/right parens and a list of comma
    /// locations.
-@@ -5952,7 +5954,8 @@ public:
+@@ -5965,7 +5967,8 @@ public:
                             MultiExprArg ArgExprs, SourceLocation RParenLoc,
                             Expr *ExecConfig = nullptr,
                             bool IsExecConfig = false,
@@ -227,7 +228,7 @@ index 5fdca93c66ab..b575f373c1ba 100644
    Expr *BuildBuiltinCallExpr(SourceLocation Loc, Builtin::ID Id,
                               MultiExprArg CallArgs);
    enum class AtomicArgumentOrder { API, AST };
-@@ -5965,7 +5968,8 @@ public:
+@@ -5978,7 +5981,8 @@ public:
    BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl, SourceLocation LParenLoc,
                          ArrayRef<Expr *> Arg, SourceLocation RParenLoc,
                          Expr *Config = nullptr, bool IsExecConfig = false,
@@ -237,7 +238,7 @@ index 5fdca93c66ab..b575f373c1ba 100644
  
    ExprResult ActOnCUDAExecConfigExpr(Scope *S, SourceLocation LLLLoc,
                                       MultiExprArg ExecConfig,
-@@ -6016,10 +6020,11 @@ private:
+@@ -6029,10 +6033,11 @@ private:
  public:
    ExprResult ActOnBinOp(Scope *S, SourceLocation TokLoc,
                          tok::TokenKind Kind, Expr *LHSExpr, Expr *RHSExpr);
@@ -252,7 +253,7 @@ index 5fdca93c66ab..b575f373c1ba 100644
    void LookupBinOp(Scope *S, SourceLocation OpLoc, BinaryOperatorKind Opc,
                     UnresolvedSetImpl &Functions);
  
-@@ -12754,8 +12759,8 @@ public:
+@@ -12775,8 +12780,8 @@ public:
    QualType InvalidLogicalVectorOperands(SourceLocation Loc, ExprResult &LHS,
                                   ExprResult &RHS);
    QualType CheckPointerToMemberOperands( // C++ 5.5
@@ -264,33 +265,35 @@ index 5fdca93c66ab..b575f373c1ba 100644
      ExprResult &LHS, ExprResult &RHS, SourceLocation Loc, bool IsCompAssign,
      bool IsDivide);
 diff --git a/clang/lib/AST/ExprConstant.cpp b/clang/lib/AST/ExprConstant.cpp
-index d8632f53bb1e..580268edc391 100644
+index dfa48e9c030b..747a7f479305 100644
 --- a/clang/lib/AST/ExprConstant.cpp
 +++ b/clang/lib/AST/ExprConstant.cpp
-@@ -8437,6 +8437,8 @@ bool LValueExprEvaluator::VisitCallExpr(const CallExpr *E) {
+@@ -8439,6 +8439,9 @@ bool LValueExprEvaluator::VisitCallExpr(const CallExpr *E) {
    case Builtin::BIforward_like:
    case Builtin::BImove:
    case Builtin::BImove_if_noexcept:
++  case Builtin::BI__invoke:
 +  case Builtin::BIinvoke:
 +  case Builtin::BIinvoke_r:
      if (cast<FunctionDecl>(E->getCalleeDecl())->isConstexpr())
        return Visit(E->getArg(0));
      break;
 diff --git a/clang/lib/CodeGen/CGBuiltin.cpp b/clang/lib/CodeGen/CGBuiltin.cpp
-index a513eae46e35..d2087a6a1d92 100644
+index 8b19bf85d47a..3fe706dd5021 100644
 --- a/clang/lib/CodeGen/CGBuiltin.cpp
 +++ b/clang/lib/CodeGen/CGBuiltin.cpp
-@@ -4842,6 +4842,8 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
+@@ -4900,6 +4900,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
    case Builtin::BIforward:
    case Builtin::BIforward_like:
    case Builtin::BIas_const:
++  case Builtin::BI__invoke:
 +  case Builtin::BIinvoke:
 +  case Builtin::BIinvoke_r:
      return RValue::get(EmitLValue(E->getArg(0)).getPointer(*this));
    case Builtin::BI__GetExceptionInfo: {
      if (llvm::GlobalVariable *GV =
 diff --git a/clang/lib/Sema/SemaChecking.cpp b/clang/lib/Sema/SemaChecking.cpp
-index 3932d9cd07d9..1c76a96ad6d0 100644
+index fad70223362e..b08cee8f6fa2 100644
 --- a/clang/lib/Sema/SemaChecking.cpp
 +++ b/clang/lib/Sema/SemaChecking.cpp
 @@ -28,6 +28,7 @@
@@ -301,10 +304,11 @@ index 3932d9cd07d9..1c76a96ad6d0 100644
  #include "clang/AST/NonTrivialTypeVisitor.h"
  #include "clang/AST/OperationKinds.h"
  #include "clang/AST/RecordLayout.h"
-@@ -2532,6 +2533,11 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
+@@ -2545,6 +2546,12 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
      }
      break;
    }
++  case Builtin::BI__invoke:
 +  case Builtin::BIinvoke:
 +  case Builtin::BIinvoke_r: {
 +    TheCallResult = BuildStdInvokeCall(TheCall, FDecl, BuiltinID);
@@ -314,13 +318,14 @@ index 3932d9cd07d9..1c76a96ad6d0 100644
    case Builtin::BIread_pipe:
    case Builtin::BIwrite_pipe:
 diff --git a/clang/lib/Sema/SemaDecl.cpp b/clang/lib/Sema/SemaDecl.cpp
-index d94366dac102..6ae9a378e3f0 100644
+index 59c7ce36fbff..26c3c5dee11d 100644
 --- a/clang/lib/Sema/SemaDecl.cpp
 +++ b/clang/lib/Sema/SemaDecl.cpp
-@@ -9728,6 +9728,9 @@ static bool isStdBuiltin(ASTContext &Ctx, FunctionDecl *FD,
+@@ -9728,6 +9728,10 @@ static bool isStdBuiltin(ASTContext &Ctx, FunctionDecl *FD,
      const auto *FPT = FD->getType()->castAs<FunctionProtoType>();
      return FPT->getNumParams() == 1 && !FPT->isVariadic();
    }
++  case Builtin::BI__invoke:
 +  case Builtin::BIinvoke:
 +  case Builtin::BIinvoke_r:
 +    return true;
@@ -328,7 +333,7 @@ index d94366dac102..6ae9a378e3f0 100644
    default:
      return false;
 diff --git a/clang/lib/Sema/SemaExpr.cpp b/clang/lib/Sema/SemaExpr.cpp
-index 3e9c3fad0391..494c269917c7 100644
+index 92496b03ecab..02a10dbb8e39 100644
 --- a/clang/lib/Sema/SemaExpr.cpp
 +++ b/clang/lib/Sema/SemaExpr.cpp
 @@ -225,7 +225,8 @@ bool Sema::DiagnoseUseOfDecl(NamedDecl *D, ArrayRef<SourceLocation> Locs,
@@ -634,7 +639,7 @@ index 3e9c3fad0391..494c269917c7 100644
  
  // Unary Operators.  'Tok' is the token for the operator.
 diff --git a/clang/lib/Sema/SemaExprCXX.cpp b/clang/lib/Sema/SemaExprCXX.cpp
-index 7c88a97ddb24..a0aac6119d65 100644
+index a7be01319a72..470d26681902 100644
 --- a/clang/lib/Sema/SemaExprCXX.cpp
 +++ b/clang/lib/Sema/SemaExprCXX.cpp
 @@ -17,7 +17,9 @@
@@ -655,7 +660,7 @@ index 7c88a97ddb24..a0aac6119d65 100644
  #include "clang/Basic/TargetInfo.h"
  #include "clang/Basic/TokenKinds.h"
  #include "clang/Basic/TypeTraits.h"
-@@ -5857,6 +5860,183 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
+@@ -5839,6 +5842,183 @@ static bool EvaluateBinaryTypeTrait(Sema &Self, TypeTrait BTT, QualType LhsT,
    llvm_unreachable("Unknown type trait or not implemented");
  }
  
@@ -807,7 +812,7 @@ index 7c88a97ddb24..a0aac6119d65 100644
 +
 +  ExprResult Result =
 +      HandleInvoke(*this, TheCall, BuiltinID == Builtin::BIinvoke_r);
-+  if (BuiltinID == Builtin::BIinvoke || Result.isInvalid())
++  if (BuiltinID == Builtin::BIinvoke || BuiltinID == Builtin::BI__invoke || Result.isInvalid())
 +    return Result;
 +
 +  QualType ResultType = Result.get()->getType();
@@ -839,7 +844,7 @@ index 7c88a97ddb24..a0aac6119d65 100644
  ExprResult Sema::ActOnArrayTypeTrait(ArrayTypeTrait ATT,
                                       SourceLocation KWLoc,
                                       ParsedType Ty,
-@@ -5988,8 +6168,8 @@ ExprResult Sema::BuildExpressionTrait(ExpressionTrait ET,
+@@ -5970,8 +6150,8 @@ ExprResult Sema::BuildExpressionTrait(ExpressionTrait ET,
  
  QualType Sema::CheckPointerToMemberOperands(ExprResult &LHS, ExprResult &RHS,
                                              ExprValueKind &VK,
@@ -850,7 +855,7 @@ index 7c88a97ddb24..a0aac6119d65 100644
    assert(!LHS.get()->hasPlaceholderType() && !RHS.get()->hasPlaceholderType() &&
           "placeholders should have been weeded out by now");
  
-@@ -6107,16 +6287,28 @@ QualType Sema::CheckPointerToMemberOperands(ExprResult &LHS, ExprResult &RHS,
+@@ -6089,16 +6269,28 @@ QualType Sema::CheckPointerToMemberOperands(ExprResult &LHS, ExprResult &RHS,
            Diag(Loc, getLangOpts().CPlusPlus20
                          ? diag::warn_cxx17_compat_pointer_to_const_ref_member_on_rvalue
                          : diag::ext_pointer_to_const_ref_member_on_rvalue);
@@ -884,7 +889,7 @@ index 7c88a97ddb24..a0aac6119d65 100644
      }
    }
 diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
-index fb62dee4aa58..0f026cab568e 100644
+index 3ba7266122e4..e808a093c262 100644
 --- a/clang/lib/Sema/SemaOverload.cpp
 +++ b/clang/lib/Sema/SemaOverload.cpp
 @@ -55,11 +55,13 @@ static bool functionHasPassObjectSizeParams(const FunctionDecl *FD) {
@@ -906,7 +911,7 @@ index fb62dee4aa58..0f026cab568e 100644
      return ExprError();
    // If FoundDecl is different from Fn (such as if one is a template
    // and the other a specialization), make sure DiagnoseUseOfDecl is
-@@ -13700,10 +13702,11 @@ ExprResult Sema::CreateUnresolvedLookupExpr(CXXRecordDecl *NamingClass,
+@@ -13705,10 +13707,11 @@ ExprResult Sema::CreateUnresolvedLookupExpr(CXXRecordDecl *NamingClass,
  /// by CreateOverloadedUnaryOp().
  ///
  /// \param Input The input argument.
@@ -922,7 +927,7 @@ index fb62dee4aa58..0f026cab568e 100644
    OverloadedOperatorKind Op = UnaryOperator::getOverloadedOperator(Opc);
    assert(Op != OO_None && "Invalid opcode for overloaded unary operator");
    DeclarationName OpName = Context.DeclarationNames.getCXXOperatorName(Op);
-@@ -13873,7 +13876,7 @@ Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
+@@ -13878,7 +13881,7 @@ Sema::CreateOverloadedUnaryOp(SourceLocation OpLoc, UnaryOperatorKind Opc,
    // Either we found no viable overloaded operator or we matched a
    // built-in operator. In either case, fall through to trying to
    // build a built-in operation.
@@ -931,7 +936,7 @@ index fb62dee4aa58..0f026cab568e 100644
  }
  
  /// Perform lookup for an overloaded binary operator.
-@@ -13963,12 +13966,11 @@ void Sema::LookupOverloadedBinOp(OverloadCandidateSet &CandidateSet,
+@@ -13968,12 +13971,11 @@ void Sema::LookupOverloadedBinOp(OverloadCandidateSet &CandidateSet,
  ///        the function in question. Such a function is never a candidate in
  ///        our overload resolution. This also enables synthesizing a three-way
  ///        comparison from < and == as described in C++20 [class.spaceship]p1.
@@ -949,7 +954,7 @@ index fb62dee4aa58..0f026cab568e 100644
    Expr *Args[2] = { LHS, RHS };
    LHS=RHS=nullptr; // Please use only Args instead of LHS/RHS couple
  
-@@ -14024,12 +14026,12 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+@@ -14029,12 +14031,12 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
    // problems. So we do it this way, which pretty much follows what GCC does.
    // Note that we go the traditional code path for compound assignment forms.
    if (Opc == BO_Assign && !Args[0]->getType()->isOverloadableType())
@@ -964,7 +969,7 @@ index fb62dee4aa58..0f026cab568e 100644
  
    // Build the overload set.
    OverloadCandidateSet CandidateSet(OpLoc, OverloadCandidateSet::CSK_Operator,
-@@ -14335,7 +14337,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+@@ -14340,7 +14342,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
  
          // No viable function; try to create a built-in operation, which will
          // produce an error. Then, show the non-viable candidates.
@@ -973,7 +978,7 @@ index fb62dee4aa58..0f026cab568e 100644
        }
        assert(Result.isInvalid() &&
               "C++ binary operator overloading is missing candidates!");
-@@ -14386,7 +14388,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
+@@ -14391,7 +14393,7 @@ ExprResult Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
    }
  
    // We matched a built-in operator; build it.
@@ -982,7 +987,7 @@ index fb62dee4aa58..0f026cab568e 100644
  }
  
  ExprResult Sema::BuildSynthesizedThreeWayComparison(
-@@ -14713,12 +14715,10 @@ ExprResult Sema::CreateOverloadedArraySubscriptExpr(SourceLocation LLoc,
+@@ -14718,12 +14720,10 @@ ExprResult Sema::CreateOverloadedArraySubscriptExpr(SourceLocation LLoc,
  /// parameter). The caller needs to validate that the member
  /// expression refers to a non-static member function or an overloaded
  /// member function.
@@ -999,7 +1004,7 @@ index fb62dee4aa58..0f026cab568e 100644
    assert(MemExprE->getType() == Context.BoundMemberTy ||
           MemExprE->getType() == Context.OverloadTy);
  
-@@ -14752,10 +14752,16 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+@@ -14757,10 +14757,16 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
      difference.removeAddressSpace();
      if (difference) {
        std::string qualsString = difference.getAsString();
@@ -1020,7 +1025,7 @@ index fb62dee4aa58..0f026cab568e 100644
      }
  
      CXXMemberCallExpr *call = CXXMemberCallExpr::Create(
-@@ -14766,7 +14772,8 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+@@ -14771,7 +14777,8 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
                              call, nullptr))
        return ExprError();
  
@@ -1030,7 +1035,7 @@ index fb62dee4aa58..0f026cab568e 100644
        return ExprError();
  
      if (CheckOtherCall(call, proto))
-@@ -15009,11 +15016,11 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
+@@ -15014,11 +15021,11 @@ ExprResult Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
  /// type (C++ [over.call.object]), which can end up invoking an
  /// overloaded function call operator (@c operator()) or performing a
  /// user-defined conversion on the object argument.
@@ -1047,7 +1052,7 @@ index fb62dee4aa58..0f026cab568e 100644
    if (checkPlaceholderForOverload(*this, Obj))
      return ExprError();
    ExprResult Object = Obj;
-@@ -15119,6 +15126,8 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+@@ -15124,6 +15131,8 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
  
    // Perform overload resolution.
    OverloadCandidateSet::iterator Best;
@@ -1056,7 +1061,7 @@ index fb62dee4aa58..0f026cab568e 100644
    switch (CandidateSet.BestViableFunction(*this, Object.get()->getBeginLoc(),
                                            Best)) {
    case OR_Success:
-@@ -15129,33 +15138,35 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+@@ -15134,33 +15143,35 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
    case OR_No_Viable_Function: {
      PartialDiagnostic PD =
          CandidateSet.empty()
@@ -1110,7 +1115,7 @@ index fb62dee4aa58..0f026cab568e 100644
      break;
    }
  
-@@ -15212,10 +15223,9 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
+@@ -15217,10 +15228,9 @@ Sema::BuildCallToObjectOfClassType(Scope *S, Expr *Obj,
    DeclarationNameInfo OpLocInfo(
                 Context.DeclarationNames.getCXXOperatorName(OO_Call), LParenLoc);
    OpLocInfo.setCXXOperatorNameRange(SourceRange(LParenLoc, RParenLoc));
@@ -1126,13 +1131,16 @@ index fb62dee4aa58..0f026cab568e 100644
  
 diff --git a/clang/test/SemaCXX/builtin-std-invoke.cpp b/clang/test/SemaCXX/builtin-std-invoke.cpp
 new file mode 100644
-index 000000000000..cafda54f04b8
+index 000000000000..8a8bbf967598
 --- /dev/null
 +++ b/clang/test/SemaCXX/builtin-std-invoke.cpp
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,600 @@
 +// RUN: %clang_cc1 -fsyntax-only -std=c++17 -verify %s
 +
 +namespace std {
++template <class F, class... Args>
++void __invoke(F &&, Args &&...); // expected-note{{requires at least 1 argument, but 0 were provided}}
++
 +template <class F, class... Args>
 +void invoke(F &&, Args &&...); // expected-note{{requires at least 1 argument, but 0 were provided}}
 +
@@ -1164,6 +1172,10 @@ index 000000000000..cafda54f04b8
 +
 +template <class Returns, bool IsNoexcept, int ExpectedResult, class F, class T, class... Args>
 +constexpr void bullet_1(F f, T &&t, Args... args) {
++  assert(std::__invoke(f, static_cast<T &&>(t), args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::__invoke(f, static_cast<T &&>(t), args...)), Returns));
++  static_assert(noexcept(std::__invoke(f, static_cast<T &&>(t), args...)) == IsNoexcept);
++
 +  assert(std::invoke(f, static_cast<T &&>(t), args...) == ExpectedResult);
 +  static_assert(__is_same(decltype(std::invoke(f, static_cast<T &&>(t), args...)), Returns));
 +  static_assert(noexcept(std::invoke(f, static_cast<T &&>(t), args...)) == IsNoexcept);
@@ -1180,6 +1192,11 @@ index 000000000000..cafda54f04b8
 +template <class Returns, bool IsNoexcept, int ExpectedResult, class F, class T, class... Args>
 +constexpr void bullet_2(F f, T &t, Args... args) {
 +  std::reference_wrapper<T> rw(t);
++
++  assert(std::__invoke(f, rw, args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::__invoke(f, rw, args...)), Returns));
++  static_assert(noexcept(std::__invoke(f, rw, args...)) == IsNoexcept);
++
 +  assert(std::invoke(f, rw, args...) == ExpectedResult);
 +  static_assert(__is_same(decltype(std::invoke(f, rw, args...)), Returns));
 +  static_assert(noexcept(std::invoke(f, rw, args...)) == IsNoexcept);
@@ -1206,6 +1223,14 @@ index 000000000000..cafda54f04b8
 +
 +template <class Returns, bool IsNoexcept, int ExpectedResult, class F, class T, class... Args>
 +constexpr void bullet_3(F f, T &t, Args... args) {
++  assert(std::__invoke(f, &t, args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::__invoke(f, &t, args...)), Returns));
++  static_assert(noexcept(std::__invoke(f, &t, args...)) == IsNoexcept);
++
++  assert(std::__invoke(f, PointerWrapper(t), args...) == ExpectedResult);
++  static_assert(__is_same(decltype(std::__invoke(f, PointerWrapper(t), args...)), Returns));
++  static_assert(noexcept(std::__invoke(f, PointerWrapper(t), args...)) == IsNoexcept);
++
 +  assert(std::invoke(f, &t, args...) == ExpectedResult);
 +  static_assert(__is_same(decltype(std::invoke(f, &t, args...)), Returns));
 +  static_assert(noexcept(std::invoke(f, &t, args...)) == IsNoexcept);
@@ -1249,6 +1274,10 @@ index 000000000000..cafda54f04b8
 +
 +template <class Returns, class F, class T, class U>
 +constexpr void bullet_4(F f, T &&t, U ExpectedResult) {
++  assert(std::__invoke(f, static_cast<T &&>(t)) == ExpectedResult);
++  static_assert(__is_same(decltype(std::__invoke(f, static_cast<T &&>(t))), Returns));
++  static_assert(noexcept(std::__invoke(f, static_cast<T &&>(t))));
++
 +  assert(std::invoke(f, static_cast<T &&>(t)) == ExpectedResult);
 +  static_assert(__is_same(decltype(std::invoke(f, static_cast<T &&>(t))), Returns));
 +  static_assert(noexcept(std::invoke(f, static_cast<T &&>(t))));
@@ -1265,6 +1294,11 @@ index 000000000000..cafda54f04b8
 +template <class Returns, class F, class T, class U>
 +constexpr void bullet_5(F f, T &t, U ExpectedResult) {
 +  std::reference_wrapper<T> rw(t);
++
++  assert(std::__invoke(f, rw) == ExpectedResult);
++  static_assert(__is_same(decltype(std::__invoke(f, rw)), Returns));
++  static_assert(noexcept(std::__invoke(f, rw)));
++
 +  assert(std::invoke(f, rw) == ExpectedResult);
 +  static_assert(__is_same(decltype(std::invoke(f, rw)), Returns));
 +  static_assert(noexcept(std::invoke(f, rw)));
@@ -1280,6 +1314,14 @@ index 000000000000..cafda54f04b8
 +
 +template <class Returns, class F, class T, class U>
 +constexpr void bullet_6(F f, T &t, U ExpectedResult) {
++  assert(std::__invoke(f, &t) == ExpectedResult);
++  static_assert(__is_same(decltype(std::__invoke(f, &t)), Returns));
++  static_assert(noexcept(std::__invoke(f, &t)));
++
++  assert(std::__invoke(f, PointerWrapper(t)) == ExpectedResult);
++  static_assert(__is_same(decltype(std::__invoke(f, PointerWrapper(t))), Returns));
++  static_assert(noexcept(std::__invoke(f, PointerWrapper(t))));
++
 +  assert(std::invoke(f, &t) == ExpectedResult);
 +  static_assert(__is_same(decltype(std::invoke(f, &t)), Returns));
 +  static_assert(noexcept(std::invoke(f, &t)));
@@ -1322,7 +1364,7 @@ index 000000000000..cafda54f04b8
 +}
 +
 +constexpr int zero() { return 0; }
-+constexpr int square(int x) { return x * x; } // expected-note 4 {{'square' declared here}}
++constexpr int square(int x) { return x * x; } // expected-note 6 {{'square' declared here}}
 +constexpr double product(double x, double y) { return x * y; }
 +
 +struct summation {
@@ -1335,14 +1377,18 @@ index 000000000000..cafda54f04b8
 +struct callable {
 +  int x;
 +
-+  constexpr int &operator()() &noexcept { return x; }                                          // expected-note 2 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
-+  constexpr const int &operator()() const &noexcept { return x; }                              // expected-note 2 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
-+  constexpr int &&operator()() &&noexcept { return static_cast<int &&>(x); }                   // expected-note 2 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
-+  constexpr const int &&operator()() const &&noexcept { return static_cast<const int &&>(x); } // expected-note 2 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
++  constexpr int &operator()() &noexcept { return x; }                                          // expected-note 3 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
++  constexpr const int &operator()() const &noexcept { return x; }                              // expected-note 3 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
++  constexpr int &&operator()() &&noexcept { return static_cast<int &&>(x); }                   // expected-note 3 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
++  constexpr const int &&operator()() const &&noexcept { return static_cast<const int &&>(x); } // expected-note 3 {{candidate function not viable: requires 0 arguments, but 2 were provided}}
 +};
 +
 +template <class T, auto expected, bool IsNoexcept, class F, class... Args>
 +constexpr bool bullet_7(F &&f, Args &&...args) {
++  assert(std::__invoke(static_cast<F>(f), static_cast<Args>(args)...) == expected);
++  static_assert(__is_same(decltype(std::__invoke(static_cast<F>(f), static_cast<Args>(args)...)), T));
++  static_assert(noexcept(std::__invoke(static_cast<F>(f), static_cast<Args>(args)...)) == IsNoexcept);
++
 +  assert(std::invoke(static_cast<F>(f), static_cast<Args>(args)...) == expected);
 +  static_assert(__is_same(decltype(std::invoke(static_cast<F>(f), static_cast<Args>(args)...)), T));
 +  static_assert(noexcept(std::invoke(static_cast<F>(f), static_cast<Args>(args)...)) == IsNoexcept);
@@ -1361,8 +1407,12 @@ index 000000000000..cafda54f04b8
 +template <class T, class Expected>
 +constexpr bool bullet_7_1() {
 +  callable c{21};
-+  return std::invoke(static_cast<T>(c)) == 21 &&
-+         __is_same(decltype(std::invoke(static_cast<T>(c))), Expected) &&noexcept(std::invoke(static_cast<T>(c)));
++  return std::__invoke(static_cast<T>(c)) == 21 &&
++         __is_same(decltype(std::__invoke(static_cast<T>(c))), Expected) &&
++         noexcept(std::__invoke(static_cast<T>(c))) &&
++         std::invoke(static_cast<T>(c)) == 21 &&
++         __is_same(decltype(std::invoke(static_cast<T>(c))), Expected) &&
++         noexcept(std::invoke(static_cast<T>(c)));
 +}
 +
 +struct Base {
@@ -1415,38 +1465,47 @@ index 000000000000..cafda54f04b8
 +}
 +
 +struct Ambiguous {
-+  int operator()(int) const;           // expected-note 2 {{candidate function}}
-+  long operator()(unsigned int) const; // expected-note 2 {{candidate function}}
++  int operator()(int) const;           // expected-note 3 {{candidate function}}
++  long operator()(unsigned int) const; // expected-note 3 {{candidate function}}
 +};
 +
 +struct Deleted {
-+  int operator()() const = delete; // expected-note 2 {{candidate function has been explicitly deleted}}
++  int operator()() const = delete; // expected-note 3 {{candidate function has been explicitly deleted}}
 +};
 +
-+int deleted_function() = delete; // expected-note 2 {{'deleted_function' has been explicitly marked deleted here}}
++int deleted_function() = delete; // expected-note 3 {{'deleted_function' has been explicitly marked deleted here}}
 +
 +struct Incompatible {};
 +
 +void test_errors() {
 +  // TODO: add cases for bullets 1--6 where 2nd param is an int
++  std::__invoke();      // expected-error{{no matching function for call to '__invoke'}}
 +  std::invoke();        // expected-error{{no matching function for call to 'invoke'}}
 +  std::invoke_r<int>(); // expected-error{{no matching function for call to 'invoke_r'}}
 +
 +  { // Concerning bullet 1
++    std::__invoke(&Base::plus);
++    // expected-error@-1{{can't invoke pointer-to-member function: 'std::invoke' must have at least 2 arguments for a pointer-to-member function, got 1}}
 +    std::invoke(&Base::plus);
 +    // expected-error@-1{{can't invoke pointer-to-member function: 'std::invoke' must have at least 2 arguments for a pointer-to-member function, got 1}}
 +    std::invoke_r<double>(&Base::plus);
 +    // expected-error@-1{{can't invoke pointer-to-member function: 'std::invoke_r' must have at least 2 arguments for a pointer-to-member function, got 1}}
++    std::__invoke(&Base::plus, Incompatible{}, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
 +    std::invoke(&Base::plus, Incompatible{}, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
 +    std::invoke_r<double>(&Base::plus, Incompatible{}, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
 +
++    std::__invoke(&Base::sum, Base{}, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 1}}
 +    std::invoke(&Base::sum, Base{}, 0);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 1}}
 +    std::invoke_r<double>(&Base::sum, Base{}, 0);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 1}}
 +
++    std::__invoke(&Base::sum, Base{}, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 10}}
 +    std::invoke(&Base::sum, Base{}, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 6 arguments, got 10}}
 +    std::invoke_r<double>(&Base::sum, Base{}, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
@@ -1456,28 +1515,38 @@ index 000000000000..cafda54f04b8
 +    // expected-error@-1{{can't invoke pointer-to-member function: return type 'const int' isn't convertible to 'void *'}}
 +
 +    const Base cb;
++    std::__invoke(&Base::plus, cb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const' qualifier}}
 +    std::invoke(&Base::plus, cb, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const' qualifier}}
 +    std::invoke_r<double>(&Base::plus, cb, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const' qualifier}}
 +
 +    volatile Base vb;
++    std::__invoke(&Base::plus, vb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'volatile' qualifier}}
 +    std::invoke(&Base::plus, vb, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'volatile' qualifier}}
 +    std::invoke_r<double>(&Base::plus, vb, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'volatile' qualifier}}
 +
 +    const volatile Base cvb;
++    std::__invoke(&Base::plus, cvb, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const volatile' qualifiers}}
 +    std::invoke(&Base::plus, cvb, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const volatile' qualifiers}}
 +    std::invoke_r<double>(&Base::plus, cvb, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' drops 'const volatile' qualifiers}}
 +
++    std::__invoke(&Base::plus, Base{}, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' can only be called on an lvalue}}
 +    std::invoke(&Base::plus, Base{}, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' can only be called on an lvalue}}
 +    std::invoke_r<double>(&Base::plus, Base{}, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::plus' can only be called on an lvalue}}
 +
++    std::__invoke(&Base::sum, cb, 1, 2, 3, 4, 5, 6);
++    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::sum' can only be called on an rvalue}}
 +    std::invoke(&Base::sum, cb, 1, 2, 3, 4, 5, 6);
 +    // expected-error@-1{{can't invoke pointer-to-member function: '&Base::sum' can only be called on an rvalue}}
 +    std::invoke_r<double>(&Base::sum, cb, 1, 2, 3, 4, 5, 6);
@@ -1490,16 +1559,22 @@ index 000000000000..cafda54f04b8
 +    Incompatible p;
 +    std::reference_wrapper<Incompatible> pw(p);
 +
++    std::__invoke(&Base::plus, pw, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
 +    std::invoke(&Base::plus, pw, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
 +    std::invoke_r<double>(&Base::plus, pw, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
 +
++    std::__invoke(&Base::plus, rw, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
 +    std::invoke(&Base::plus, rw, 0);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
 +    std::invoke_r<double>(&Base::plus, rw, 0);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
 +
++    std::__invoke(&Base::plus, rw, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 10}}
 +    std::invoke(&Base::plus, rw, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 10}}
 +    std::invoke_r<double>(&Base::plus, rw, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
@@ -1512,16 +1587,22 @@ index 000000000000..cafda54f04b8
 +    Base b;
 +    Incompatible p;
 +
++    std::__invoke(&Base::plus, &p, 1, 2);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
 +    std::invoke(&Base::plus, &p, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
 +    std::invoke_r<double>(&Base::plus, &p, 1, 2);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
 +
++    std::__invoke(&Base::plus, &b, 0);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
 +    std::invoke(&Base::plus, &b, 0);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
 +    std::invoke_r<double>(&Base::plus, &b, 0);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 1}}
 +
++    std::__invoke(&Base::plus, &b, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
++    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 10}}
 +    std::invoke(&Base::plus, &b, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
 +    // expected-error@-1{{can't invoke pointer-to-member function: expected 2 arguments, got 10}}
 +    std::invoke_r<double>(&Base::plus, &b, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
@@ -1531,16 +1612,22 @@ index 000000000000..cafda54f04b8
 +    // expected-error@-1{{can't invoke pointer-to-member function: return type 'int' isn't convertible to 'void *'}}
 +  }
 +  { // Concerning bullet 4
++    std::__invoke(&Base::data);
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +    std::invoke(&Base::data);
 +    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +    std::invoke_r<double>(&Base::data);
 +    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke_r' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +
++    std::__invoke(&Base::data, Incompatible{});
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
 +    std::invoke(&Base::data, Incompatible{});
 +    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
 +    std::invoke_r<double>(&Base::data, Incompatible{});
 +    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a reference to a class compatible with 'Base', got 'Incompatible'}}
 +
++    std::__invoke(&Base::data, Base{}, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +    std::invoke(&Base::data, Base{}, Base{});
 +    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +    std::invoke_r<double>(&Base::data, Base{}, Base{});
@@ -1556,11 +1643,15 @@ index 000000000000..cafda54f04b8
 +    Incompatible p;
 +    std::reference_wrapper<Incompatible> pw(p);
 +
++    std::__invoke(&Base::data, pw);
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
 +    std::invoke(&Base::data, pw);
 +    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
 +    std::invoke_r<double>(&Base::data, pw);
 +    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a wrapee to a class compatible with 'Base', got 'Incompatible'}}
 +
++    std::__invoke(&Base::data, rw, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +    std::invoke(&Base::data, rw, Base{});
 +    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +    std::invoke_r<double>(&Base::data, rw, Base{});
@@ -1573,11 +1664,15 @@ index 000000000000..cafda54f04b8
 +    Base b;
 +    Incompatible p;
 +
++    std::__invoke(&Base::data, &p);
++    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
 +    std::invoke(&Base::data, &p);
 +    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
 +    std::invoke_r<double>(&Base::data, &p);
 +    // expected-error@-1{{can't invoke pointer-to-data member: expected second argument to be a pointer to a class compatible with 'Base', got 'Incompatible *'}}
 +
++    std::__invoke(&Base::data, &b, Base{});
++    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +    std::invoke(&Base::data, &b, Base{});
 +    // expected-error@-1{{can't invoke pointer-to-data member: 'std::invoke' must have exactly 2 arguments for a pointer-to-data member, got 1}}
 +    std::invoke_r<double>(&Base::data, &b, Base{});
@@ -1587,26 +1682,36 @@ index 000000000000..cafda54f04b8
 +    // expected-error@-1{{can't invoke pointer-to-data member: return type 'int' isn't convertible to 'void *'}}
 +  }
 +  { // Concerning bullet 7
++    std::__invoke(square);
++    // expected-error@-1{{can't invoke function: expected 1 argument, got 0}}
 +    std::invoke(square);
 +    // expected-error@-1{{can't invoke function: expected 1 argument, got 0}}
 +    std::invoke_r<double>(square);
 +    // expected-error@-1{{can't invoke function: expected 1 argument, got 0}}
 +
++    std::__invoke(square, 1, 2);
++    // expected-error@-1{{can't invoke function: expected 1 argument, got 2}}
 +    std::invoke(square, 1, 2);
 +    // expected-error@-1{{can't invoke function: expected 1 argument, got 2}}
 +    std::invoke_r<double>(square, 1, 2);
 +    // expected-error@-1{{can't invoke function: expected 1 argument, got 2}}
 +
++    std::__invoke(&product, 1);
++    // expected-error@-1{{can't invoke function: expected 2 arguments, got 1}}
 +    std::invoke(&product, 1);
 +    // expected-error@-1{{can't invoke function: expected 2 arguments, got 1}}
 +    std::invoke_r<double>(&product, 1);
 +    // expected-error@-1{{can't invoke function: expected 2 arguments, got 1}}
 +
++    std::__invoke(deleted_function);
++    // expected-error@-1{{attempt to use a deleted function}}
 +    std::invoke(deleted_function);
 +    // expected-error@-1{{attempt to use a deleted function}}
 +    std::invoke_r<double>(deleted_function);
 +    // expected-error@-1{{attempt to use a deleted function}}
 +
++    std::__invoke(callable{1}, 1, 2);
++    // expected-error@-1{{can't invoke 'callable' function object: no suitable overload found}}
 +    std::invoke(callable{1}, 1, 2);
 +    // expected-error@-1{{can't invoke 'callable' function object: no suitable overload found}}
 +    std::invoke_r<double>(callable{1}, 1, 2);
@@ -1615,11 +1720,15 @@ index 000000000000..cafda54f04b8
 +    std::invoke_r<callable>(callable{1});
 +    // expected-error@-1{{can't invoke 'callable' function object: return type 'int' isn't convertible to 'callable'}}
 +
++    std::__invoke(Ambiguous{}, 0.0);
++    // expected-error@-1{{can't invoke 'Ambiguous' function object: 2 suitable overloads found, which makes choosing ambiguous}}
 +    std::invoke(Ambiguous{}, 0.0);
 +    // expected-error@-1{{can't invoke 'Ambiguous' function object: 2 suitable overloads found, which makes choosing ambiguous}}
 +    std::invoke_r<double>(Ambiguous{}, 0.0);
 +    // expected-error@-1{{can't invoke 'Ambiguous' function object: 2 suitable overloads found, which makes choosing ambiguous}}
 +
++    std::__invoke(Deleted{});
++    // expected-error@-1{{can't invoke 'Deleted' function object: chosen overload candidate is deleted}}
 +    std::invoke(Deleted{});
 +    // expected-error@-1{{can't invoke 'Deleted' function object: chosen overload candidate is deleted}}
 +    std::invoke_r<double>(Deleted{});
@@ -1627,5 +1736,5 @@ index 000000000000..cafda54f04b8
 +  }
 +}
 -- 
-2.42.0
+2.42.0.283.g2d96d420d3-goog
 
